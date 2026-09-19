@@ -1,0 +1,139 @@
+# Template only: replace image, issuer, audience, JWKS and OpenBao address.
+# Supply token files with an OpenBao Agent or a managed, rotating Secret.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keygate
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keygate-manager
+  namespace: keygate
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: keygate-manager}
+  template:
+    metadata:
+      labels: {app: keygate-manager}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: manager
+          image: keygate:local
+          args: ["--mode", "manager", "--backend", "openbao"]
+          env:
+            - {name: KEYGATE_MANAGER_LISTEN, value: "0.0.0.0:8080"}
+            - {name: KEYGATE_PUBLIC_ORIGIN, value: "https://keys.example.com"}
+            - {name: KEYGATE_OIDC_ISSUER, value: "https://id.example.com"}
+            - {name: KEYGATE_OIDC_AUDIENCE, value: "REPLACE_CLIENT_ID"}
+            - {name: KEYGATE_OIDC_JWKS_URL, value: "https://id.example.com/REPLACE_JWKS_PATH"}
+            - {name: KEYGATE_BAO_ADDR, value: "https://openbao.example.com"}
+            - {name: KEYGATE_BAO_TOKEN_FILE, value: "/credentials/bao/token"}
+            - {name: KEYGATE_PROXY_SECRET_FILE, value: "/credentials/proxy/credential"}
+          ports: [{name: http, containerPort: 8080}]
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          volumeMounts:
+            - {name: bao, mountPath: /credentials/bao, readOnly: true}
+            - {name: proxy, mountPath: /credentials/proxy, readOnly: true}
+      volumes:
+        - name: bao
+          secret: {secretName: keygate-manager-bao, defaultMode: 0440}
+        - name: proxy
+          secret: {secretName: keygate-proxy, defaultMode: 0440}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: keygate-manager, namespace: keygate}
+spec:
+  selector: {app: keygate-manager}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: keygate-authz, namespace: keygate}
+spec:
+  selector:
+    matchLabels: {app: keygate-authz}
+  template:
+    metadata:
+      labels: {app: keygate-authz}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: authz
+          image: keygate:local
+          args: ["--mode", "authz", "--backend", "openbao"]
+          env:
+            - {name: KEYGATE_AUTHZ_LISTEN, value: "0.0.0.0:8081"}
+            - {name: KEYGATE_BAO_ADDR, value: "https://openbao.example.com"}
+            - {name: KEYGATE_BAO_TOKEN_FILE, value: "/credentials/bao/token"}
+            - {name: KEYGATE_CACHE_TTL_SECONDS, value: "30"}
+            - {name: KEYGATE_CACHE_CAPACITY, value: "1024"}
+          ports: [{name: http, containerPort: 8081}]
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          volumeMounts:
+            - {name: bao, mountPath: /credentials/bao, readOnly: true}
+      volumes:
+        - name: bao
+          secret: {secretName: keygate-authz-bao, defaultMode: 0440}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: keygate-authz, namespace: keygate}
+spec:
+  internalTrafficPolicy: Local
+  selector: {app: keygate-authz}
+  ports: [{name: http, port: 8081, targetPort: http}]
+---
+# Change namespace/pod labels to the actual Envoy data-plane labels.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: keygate-ingress, namespace: keygate}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: envoy-gateway-system}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: envoy}
+      ports:
+        - {protocol: TCP, port: 8080}
+        - {protocol: TCP, port: 8081}

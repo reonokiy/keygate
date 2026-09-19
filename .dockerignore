@@ -1,0 +1,6 @@
+target
+.git
+*.db*
+.env
+*.token
+proxy-secret
