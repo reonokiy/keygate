@@ -14,6 +14,16 @@ Rust API key 管理与 Envoy 鉴权服务，使用 PostgreSQL 存储。
        authz（每节点）→ 内存缓存 → PostgreSQL
 ```
 
+## 镜像
+
+推送到 main 或在 Actions 手动运行工作流，测试通过后自动发布 Linux amd64 镜像，无需额外配置 PAT：
+
+```sh
+docker pull ghcr.io/reonokiy/keygate:latest
+```
+
+每次发布同时提供 `sha-<完整提交 SHA>` 标签，digest 记录在 Actions 发布任务摘要中。PR 仅运行测试，不发布镜像。
+
 ## 运行
 
 需要 Rust 1.95 和 PostgreSQL。数据库连接通过 `KEYGATE_DATABASE_URL` 设置；生产连接建议使用 `sslmode=verify-full` 并配置可信 CA。
