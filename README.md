@@ -63,6 +63,8 @@ manager / all 模式启动时创建 `keygate_applications` 表；首次初始化
 
 每节点部署使用 DaemonSet 和 `internalTrafficPolicy: Local`，模板通过 Service ClusterIP 路由；按实际节点配置 toleration。默认缓存上限 1024 个应用，TTL 30 秒，可通过 `KEYGATE_CACHE_CAPACITY` / `KEYGATE_CACHE_TTL_SECONDS` 调整，TTL 为 0 时每次查库。故障不延长缓存期限，过期后查库失败则拒绝授权。
 
+管理页面支持子路径，例如 `/keys/`：代理应将 `/keys` 重定向到 `/keys/`，并在转发时去掉 `/keys` 前缀。OIDC 回调也应放在该子路径下；`KEYGATE_PUBLIC_ORIGIN` 仍填写域名 origin，不包含路径。
+
 ## API key 格式
 
 ```text
