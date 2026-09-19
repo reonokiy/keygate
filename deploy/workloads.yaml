@@ -1,12 +1,28 @@
-# Template only: replace image and OIDC settings.
+# Template only: replace image, OIDC settings and the administrator-owned app catalog.
 # Create keygate-manager-postgres and keygate-authz-postgres Secrets, each with
 # a database-url key. Authz uses a SELECT-only role; start manager first to create the table.
+# Keep application UUIDs aligned with the Envoy routes in envoy-gateway.yaml.
+# Configuration is loaded at startup: restart manager AND all authz pods after edits.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: keygate
   labels:
     pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: keygate-config, namespace: keygate}
+data:
+  keygate.json: |
+    {
+      "applications": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Codex API"
+        }
+      ]
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -33,6 +49,7 @@ spec:
           image: keygate:local
           args: ["--mode", "manager"]
           env:
+            - {name: KEYGATE_CONFIG, value: "/config/keygate.json"}
             - {name: KEYGATE_MANAGER_LISTEN, value: "0.0.0.0:8080"}
             - {name: KEYGATE_PUBLIC_ORIGIN, value: "https://keys.example.com"}
             - {name: KEYGATE_OIDC_ISSUER, value: "https://id.example.com"}
@@ -55,8 +72,11 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
             - {name: proxy, mountPath: /credentials/proxy, readOnly: true}
       volumes:
+        - name: config
+          configMap: {name: keygate-config, defaultMode: 0444}
         - name: proxy
           secret: {secretName: keygate-proxy, defaultMode: 0440}
 ---
@@ -89,6 +109,7 @@ spec:
           image: keygate:local
           args: ["--mode", "authz"]
           env:
+            - {name: KEYGATE_CONFIG, value: "/config/keygate.json"}
             - {name: KEYGATE_AUTHZ_LISTEN, value: "0.0.0.0:8081"}
             - name: KEYGATE_DATABASE_URL
               valueFrom:
@@ -107,6 +128,11 @@ spec:
             httpGet: {path: /healthz, port: http}
           livenessProbe:
             httpGet: {path: /healthz, port: http}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: keygate-config, defaultMode: 0444}
 ---
 apiVersion: v1
 kind: Service

@@ -277,9 +277,14 @@ async fn manager_returns_401_for_invalid_login_and_503_for_provider_failure() {
             json!({"keys":[p.jwk]}).to_string(),
         );
         let manager = manager_router(
-            Manager::new(store.clone(), secret.into(), "http://localhost:8080".into())
-                .unwrap()
-                .with_oidc(p.oidc()),
+            Manager::new(
+                store.clone(),
+                common::config(),
+                secret.into(),
+                "http://localhost:8080".into(),
+            )
+            .unwrap()
+            .with_oidc(p.oidc()),
         );
         let mut claims = p.claims();
         if !unavailable {

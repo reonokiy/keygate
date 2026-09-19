@@ -1,8 +1,15 @@
+FROM node:24-bookworm-slim AS frontend
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web ./
+RUN npm run check && npm run build
+
 FROM rust:1.95-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY web ./web
+COPY --from=frontend /web/dist ./web/dist
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

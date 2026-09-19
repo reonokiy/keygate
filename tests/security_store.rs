@@ -69,6 +69,7 @@ async fn postgres_cas_persistence_concurrency_and_read_only_authorizer() {
     ));
     let router = keygate::authz_router(keygate::Authorizer::new(
         std::sync::Arc::new(readonly),
+        common::config_for(&[(app.id, &app.name)]),
         std::time::Duration::ZERO,
         16,
     ));

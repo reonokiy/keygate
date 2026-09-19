@@ -1,3 +1,4 @@
+pub mod config;
 mod http;
 pub mod identity;
 pub mod model;
@@ -11,7 +12,8 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{any, delete, get, post},
 };
-use model::{Application, Versioned};
+use config::{Config, ConfiguredApplication};
+use model::{Application, Key, Versioned};
 use moka::future::Cache;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,6 +28,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Manager {
     store: Arc<dyn Store>,
+    config: Arc<Config>,
     proxy_secret: Arc<str>,
     origin: Arc<str>,
     oidc: Option<Arc<identity::Oidc>>,
@@ -37,6 +40,7 @@ impl Manager {
     }
     pub fn new(
         store: Arc<dyn Store>,
+        config: Arc<Config>,
         proxy_secret: String,
         origin: String,
     ) -> anyhow::Result<Self> {
@@ -52,6 +56,7 @@ impl Manager {
         );
         Ok(Self {
             store,
+            config,
             proxy_secret: proxy_secret.into(),
             origin: origin.into(),
             oidc: None,
@@ -140,14 +145,14 @@ pub fn manager_router(s: Manager) -> Router {
     Router::new()
         .route(
             "/",
-            get(|| async { Html(include_str!("../web/index.html")) }),
+            get(|| async { Html(include_str!("../web/dist/index.html")) }),
         )
         .route(
             "/app.js",
             get(|| async {
                 (
                     [("content-type", "text/javascript; charset=utf-8")],
-                    include_str!("../web/app.js"),
+                    include_str!("../web/dist/app.js"),
                 )
             }),
         )
@@ -156,7 +161,7 @@ pub fn manager_router(s: Manager) -> Router {
             get(|| async {
                 (
                     [("content-type", "text/css; charset=utf-8")],
-                    include_str!("../web/style.css"),
+                    include_str!("../web/dist/style.css"),
                 )
             }),
         )
@@ -168,7 +173,7 @@ pub fn manager_router(s: Manager) -> Router {
                 },
             ),
         )
-        .route("/api/apps", get(list_apps).post(create_app))
+        .route("/api/apps", get(list_apps))
         .route("/api/apps/{app}/keys", post(create_key))
         .route("/api/apps/{app}/keys/{key}", delete(revoke_key))
         .layer(middleware::from_fn_with_state(s.clone(), manager_auth))
@@ -177,8 +182,8 @@ pub fn manager_router(s: Manager) -> Router {
         .layer(middleware::from_fn(secure_response))
         .with_state(s)
 }
-fn public_app(app: &Application, owner: &str) -> Value {
-    json!({"id":app.id,"name":app.name,"keys":app.keys.iter().filter(|k| k.owner == owner).map(|k| json!({"id":k.id,"name":k.name,"created_at":k.created_at,"revoked":k.revoked})).collect::<Vec<_>>()})
+fn public_app(app: &ConfiguredApplication, keys: &[Key], owner: &str) -> Value {
+    json!({"id":app.id,"name":app.name,"keys":keys.iter().filter(|k| k.owner == owner).map(|k| json!({"id":k.id,"name":k.name,"created_at":k.created_at,"revoked":k.revoked})).collect::<Vec<_>>()})
 }
 #[derive(Deserialize)]
 struct Named {
@@ -200,30 +205,40 @@ async fn list_apps(
 ) -> Result<Json<Value>, Error> {
     let apps = s.store.list().await?;
     Ok(Json(json!(
-        apps.iter()
-            .map(|a| public_app(&a.app, &id.0))
+        s.config
+            .applications()
+            .iter()
+            .map(|configured| {
+                let keys = apps
+                    .iter()
+                    .find(|a| a.app.id == configured.id)
+                    .map_or(&[][..], |a| a.app.keys.as_slice());
+                public_app(configured, keys, &id.0)
+            })
             .collect::<Vec<_>>()
     )))
 }
-async fn create_app(
-    State(s): State<Manager>,
-    axum::Extension(id): axum::Extension<Identity>,
-    Json(body): Json<Named>,
-) -> Result<(StatusCode, Json<Value>), Error> {
-    let app = Application {
-        id: Uuid::new_v4(),
-        name: name(body.name)?,
-        keys: vec![],
-    };
-    s.store.put(&app, 0).await?;
-    Ok((StatusCode::CREATED, Json(public_app(&app, &id.0))))
-}
 async fn application(s: &Manager, app: Uuid) -> Result<Versioned, Error> {
-    s.store
-        .get(app)
-        .await?
-        .filter(|a| a.app.id == app)
-        .ok_or(Error(StatusCode::NOT_FOUND, "application not found"))
+    let configured = s
+        .config
+        .application(app)
+        .ok_or(Error(StatusCode::NOT_FOUND, "application not found"))?;
+    let mut entry = s.store.get(app).await?.unwrap_or_else(|| Versioned {
+        app: Application {
+            id: app,
+            name: configured.name.clone(),
+            keys: vec![],
+        },
+        version: 0,
+    });
+    if entry.app.id != app {
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invalid storage record",
+        ));
+    }
+    entry.app.name = configured.name.clone();
+    Ok(entry)
 }
 async fn create_key(
     State(s): State<Manager>,
@@ -268,14 +283,16 @@ struct Cached {
 #[derive(Clone)]
 pub struct Authorizer {
     store: Arc<dyn Store>,
+    config: Arc<Config>,
     cache: Cache<Uuid, Cached>,
     ttl: Duration,
     inflight: Arc<Semaphore>,
 }
 impl Authorizer {
-    pub fn new(store: Arc<dyn Store>, ttl: Duration, capacity: u64) -> Self {
+    pub fn new(store: Arc<dyn Store>, config: Arc<Config>, ttl: Duration, capacity: u64) -> Self {
         Self {
             store,
+            config,
             cache: Cache::builder()
                 .max_capacity(capacity)
                 .time_to_live(ttl.max(Duration::from_millis(1)))
@@ -285,6 +302,9 @@ impl Authorizer {
         }
     }
     async fn app(&self, id: Uuid) -> Result<Option<Arc<Application>>, Error> {
+        if !self.config.contains(id) {
+            return Ok(None);
+        }
         if let Some(c) = self.cache.get(&id).await
             && c.fetched_at.elapsed() < self.ttl
         {

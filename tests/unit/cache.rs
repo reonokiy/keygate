@@ -4,6 +4,14 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Poll,
 };
+fn configured(id: Uuid) -> Arc<crate::config::Config> {
+    Arc::new(
+        crate::config::Config::parse(
+            &serde_json::json!({"applications": [{"id": id, "name": "app"}]}).to_string(),
+        )
+        .unwrap(),
+    )
+}
 struct Probe {
     entry: Versioned,
     fail: AtomicBool,
@@ -54,7 +62,7 @@ fn probe() -> Arc<Probe> {
 async fn cache_hits_do_not_extend_revocation_deadline_or_use_stale_records() {
     let store = probe();
     let id = store.entry.app.id;
-    let auth = Authorizer::new(store.clone(), Duration::from_secs(30), 16);
+    let auth = Authorizer::new(store.clone(), configured(id), Duration::from_secs(30), 16);
     auth.app(id).await.unwrap();
     let original = auth.cache.get(&id).await.unwrap().fetched_at;
     store.fail.store(true, Ordering::SeqCst);
@@ -86,7 +94,7 @@ async fn cache_hits_do_not_extend_revocation_deadline_or_use_stale_records() {
 async fn capacity_exhaustion_closed_semaphore_and_backend_timeout_fail_closed() {
     let store = probe();
     let id = store.entry.app.id;
-    let auth = Authorizer::new(store.clone(), Duration::ZERO, 16);
+    let auth = Authorizer::new(store.clone(), configured(id), Duration::ZERO, 16);
     let permit = auth.inflight.acquire_many(32).await.unwrap();
     assert_eq!(auth.app(id).await.err().unwrap().1, "authenticator busy");
     assert_eq!(store.reads.load(Ordering::SeqCst), 0);
@@ -98,14 +106,14 @@ async fn capacity_exhaustion_closed_semaphore_and_backend_timeout_fail_closed() 
     );
     let mut hanging = probe();
     Arc::get_mut(&mut hanging).unwrap().hang = true;
-    let auth = Authorizer::new(hanging, Duration::ZERO, 16);
+    let auth = Authorizer::new(hanging, configured(id), Duration::ZERO, 16);
     assert_eq!(auth.app(id).await.err().unwrap().1, "storage timeout");
 }
 #[tokio::test]
 async fn queued_lookup_rechecks_cache_before_reading_backend() {
     let store = probe();
     let id = store.entry.app.id;
-    let auth = Authorizer::new(store.clone(), Duration::from_secs(30), 16);
+    let auth = Authorizer::new(store.clone(), configured(id), Duration::from_secs(30), 16);
     let permit = auth.inflight.acquire_many(32).await.unwrap();
     let mut pending = Box::pin(auth.app(id));
     poll_fn(|cx| {
@@ -136,7 +144,7 @@ async fn corrupt_plugin_record_is_not_cached_or_authorized() {
         } else {
             Arc::get_mut(&mut store).unwrap().entry.version = 0;
         }
-        let auth = Authorizer::new(store, Duration::from_secs(30), 16);
+        let auth = Authorizer::new(store, configured(id), Duration::from_secs(30), 16);
         assert_eq!(
             auth.app(id).await.err().unwrap().1,
             "invalid storage record"
@@ -149,7 +157,7 @@ async fn corrupt_plugin_record_is_not_cached_or_authorized() {
 async fn disabled_cache_always_reads_and_unknown_apps_are_not_cached() {
     let store = probe();
     let id = store.entry.app.id;
-    let auth = Authorizer::new(store.clone(), Duration::ZERO, 16);
+    let auth = Authorizer::new(store.clone(), configured(id), Duration::ZERO, 16);
     for _ in 0..2 {
         assert!(auth.app(id).await.unwrap().is_some());
     }
@@ -157,10 +165,29 @@ async fn disabled_cache_always_reads_and_unknown_apps_are_not_cached() {
     assert!(auth.cache.get(&id).await.is_none());
     let mut missing = probe();
     Arc::get_mut(&mut missing).unwrap().missing = true;
-    let auth = Authorizer::new(missing.clone(), Duration::from_secs(30), 16);
+    let auth = Authorizer::new(missing.clone(), configured(id), Duration::from_secs(30), 16);
     for _ in 0..2 {
         assert!(auth.app(id).await.unwrap().is_none());
     }
     assert_eq!(missing.reads.load(Ordering::SeqCst), 2);
     assert!(auth.cache.get(&id).await.is_none());
+}
+
+#[tokio::test]
+async fn unconfigured_application_cannot_authorize_from_cached_or_stored_record() {
+    let store = probe();
+    let id = store.entry.app.id;
+    let config = Arc::new(crate::config::Config::parse(r#"{"applications": []}"#).unwrap());
+    let auth = Authorizer::new(store.clone(), config, Duration::from_secs(30), 16);
+    auth.cache
+        .insert(
+            id,
+            Cached {
+                app: Arc::new(store.entry.app.clone()),
+                fetched_at: Instant::now(),
+            },
+        )
+        .await;
+    assert!(auth.app(id).await.unwrap().is_none());
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0);
 }

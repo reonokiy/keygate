@@ -1,10 +1,27 @@
 #![allow(dead_code)]
 use keygate::{
+    config::Config,
     model::{Application, Versioned},
     store::{Store, StoreError},
 };
-use std::{collections::BTreeMap, process::Command, sync::Mutex, time::Duration};
+use std::{
+    collections::BTreeMap,
+    process::Command,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use uuid::Uuid;
+pub const APP_ID: Uuid = Uuid::from_u128(1);
+pub fn config() -> Arc<Config> {
+    config_for(&[(APP_ID, "Codex")])
+}
+pub fn config_for(applications: &[(Uuid, &str)]) -> Arc<Config> {
+    let applications: Vec<_> = applications
+        .iter()
+        .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+        .collect();
+    Arc::new(Config::parse(&serde_json::json!({"applications": applications}).to_string()).unwrap())
+}
 #[derive(Default)]
 pub struct Memory(Mutex<BTreeMap<Uuid, Versioned>>);
 #[async_trait::async_trait]

@@ -47,18 +47,20 @@ async fn json_response(app: &Router, req: Request<Body>, expected: StatusCode) -
 async fn setup() -> (Arc<dyn Store>, Router) {
     let store: Arc<dyn Store> = Arc::new(common::Memory::default());
     let manager = manager_router(
-        Manager::new(store.clone(), SECRET.into(), "http://localhost:8080".into()).unwrap(),
+        Manager::new(
+            store.clone(),
+            common::config(),
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
     );
     (store, manager)
 }
 async fn create(manager: &Router) -> (Uuid, Uuid, String) {
-    let app = json_response(
-        manager,
-        request("POST", "/api/apps", "alice", json!({"name":"Codex"})),
-        StatusCode::CREATED,
-    )
-    .await;
-    let id = Uuid::parse_str(app["id"].as_str().unwrap()).unwrap();
+    issue_for(manager, common::APP_ID).await
+}
+async fn issue_for(manager: &Router, id: Uuid) -> (Uuid, Uuid, String) {
     let key = json_response(
         manager,
         request(
@@ -90,10 +92,289 @@ async fn check(auth: &Router, app: Uuid, token: &str) -> StatusCode {
         .status()
 }
 #[tokio::test]
+async fn applications_are_configured_by_admin_and_created_in_storage_only_for_keys() {
+    let store: Arc<dyn Store> = Arc::new(common::Memory::default());
+    let second = Uuid::new_v4();
+    let config = common::config_for(&[(common::APP_ID, "Codex"), (second, "Custom API")]);
+    let manager = manager_router(
+        Manager::new(
+            store.clone(),
+            config,
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
+    );
+    for owner in ["alice", "bob"] {
+        let apps = json_response(
+            &manager,
+            request("GET", "/api/apps", owner, Value::Null),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(
+            apps,
+            json!([
+                {"id": common::APP_ID, "name": "Codex", "keys": []},
+                {"id": second, "name": "Custom API", "keys": []}
+            ])
+        );
+    }
+    assert!(store.list().await.unwrap().is_empty());
+    json_response(
+        &manager,
+        request(
+            "POST",
+            "/api/apps",
+            "alice",
+            json!({"name": "User-created app"}),
+        ),
+        StatusCode::METHOD_NOT_ALLOWED,
+    )
+    .await;
+    for path in ["/", "/app.js"] {
+        let response = manager
+            .clone()
+            .oneshot(request("GET", path, "alice", Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let content = std::str::from_utf8(&body).unwrap();
+        assert!(!content.contains("create-app"));
+        assert!(!content.contains("app-name"));
+    }
+    json_response(
+        &manager,
+        request(
+            "POST",
+            &format!("/api/apps/{}/keys", common::APP_ID),
+            "alice",
+            json!({"name": "\n"}),
+        ),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(store.list().await.unwrap().is_empty());
+    let (app, key, _) = create(&manager).await;
+    let stored = store.get(app).await.unwrap().unwrap();
+    assert_eq!(stored.app.name, "Codex");
+    assert_eq!(stored.app.keys.len(), 1);
+    assert_eq!(stored.app.keys[0].id, key);
+}
+
+#[tokio::test]
+async fn catalog_names_override_storage_and_unconfigured_apps_are_inaccessible() {
+    let (store, manager) = setup().await;
+    let (app, _, token) = create(&manager).await;
+    let mut stored = store.get(app).await.unwrap().unwrap();
+    stored.app.name = "Old database name".into();
+    store.put(&stored.app, stored.version).await.unwrap();
+    let (orphan_key, orphan_token) = keygate::model::issue("alice".into(), "orphan key".into());
+    let orphan = Application {
+        id: Uuid::new_v4(),
+        name: "Unconfigured database app".into(),
+        keys: vec![orphan_key.clone()],
+    };
+    store.put(&orphan, 0).await.unwrap();
+    let apps = json_response(
+        &manager,
+        request("GET", "/api/apps", "alice", Value::Null),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(apps.as_array().unwrap().len(), 1);
+    assert_eq!(apps[0]["id"], app.to_string());
+    assert_eq!(apps[0]["name"], "Codex");
+    assert_eq!(apps[0]["keys"].as_array().unwrap().len(), 1);
+    for (method, path, body) in [
+        (
+            "POST",
+            format!("/api/apps/{}/keys", orphan.id),
+            json!({"name": "new"}),
+        ),
+        (
+            "DELETE",
+            format!("/api/apps/{}/keys/{}", orphan.id, orphan_key.id),
+            Value::Null,
+        ),
+    ] {
+        json_response(
+            &manager,
+            request(method, &path, "alice", body),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    }
+    let auth = authz_router(Authorizer::new(
+        store.clone(),
+        common::config(),
+        Duration::ZERO,
+        16,
+    ));
+    assert_eq!(check(&auth, app, &token).await, StatusCode::OK);
+    assert_eq!(
+        check(&auth, orphan.id, &orphan_token).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(store.get(orphan.id).await.unwrap().unwrap().version, 1);
+}
+
+#[tokio::test]
+async fn config_rename_preserves_existing_keys_after_restart() {
+    let (store, manager) = setup().await;
+    let (app, key, token) = create(&manager).await;
+    let config = common::config_for(&[(app, "Renamed by admin")]);
+    let manager = manager_router(
+        Manager::new(
+            store.clone(),
+            config.clone(),
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
+    );
+    let auth = authz_router(Authorizer::new(store.clone(), config, Duration::ZERO, 16));
+    let apps = json_response(
+        &manager,
+        request("GET", "/api/apps", "alice", Value::Null),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(apps[0]["id"], app.to_string());
+    assert_eq!(apps[0]["name"], "Renamed by admin");
+    assert_eq!(apps[0]["keys"][0]["id"], key.to_string());
+    assert_eq!(store.get(app).await.unwrap().unwrap().version, 1);
+    assert_eq!(check(&auth, app, &token).await, StatusCode::OK);
+    json_response(
+        &manager,
+        request(
+            "DELETE",
+            &format!("/api/apps/{app}/keys/{key}"),
+            "alice",
+            Value::Null,
+        ),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(check(&auth, app, &token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn removed_application_blocks_persisted_keys_after_config_reload() {
+    let (store, manager) = setup().await;
+    let (app, key, token) = create(&manager).await;
+    let config = common::config_for(&[]);
+    let manager = manager_router(
+        Manager::new(
+            store.clone(),
+            config.clone(),
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
+    );
+    let auth = authz_router(Authorizer::new(
+        store.clone(),
+        config,
+        Duration::from_secs(30),
+        16,
+    ));
+    let apps = json_response(
+        &manager,
+        request("GET", "/api/apps", "alice", Value::Null),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(apps, json!([]));
+    for (method, path, body) in [
+        (
+            "POST",
+            format!("/api/apps/{app}/keys"),
+            json!({"name": "new"}),
+        ),
+        ("DELETE", format!("/api/apps/{app}/keys/{key}"), Value::Null),
+    ] {
+        json_response(
+            &manager,
+            request(method, &path, "alice", body),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    }
+    assert_eq!(check(&auth, app, &token).await, StatusCode::UNAUTHORIZED);
+    let stored = store.get(app).await.unwrap().unwrap();
+    assert_eq!(stored.version, 1);
+    assert_eq!(stored.app.keys.len(), 1);
+    assert!(!stored.app.keys[0].revoked);
+}
+
+#[tokio::test]
+async fn manager_rejects_mismatched_storage_records_before_mutating_keys() {
+    struct Corrupt(Versioned);
+    #[async_trait::async_trait]
+    impl Store for Corrupt {
+        async fn get(&self, _: Uuid) -> Result<Option<Versioned>, StoreError> {
+            Ok(Some(self.0.clone()))
+        }
+        async fn list(&self) -> Result<Vec<Versioned>, StoreError> {
+            Ok(vec![self.0.clone()])
+        }
+        async fn put(&self, _: &Application, _: u64) -> Result<(), StoreError> {
+            panic!("invalid storage records must never be written")
+        }
+    }
+    let (key, _) = keygate::model::issue("alice".into(), "existing".into());
+    let key_id = key.id;
+    let store = Arc::new(Corrupt(Versioned {
+        app: Application {
+            id: Uuid::new_v4(),
+            name: "Mismatched".into(),
+            keys: vec![key],
+        },
+        version: 1,
+    }));
+    let manager = manager_router(
+        Manager::new(
+            store,
+            common::config(),
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
+    );
+    for (method, path, body) in [
+        (
+            "POST",
+            format!("/api/apps/{}/keys", common::APP_ID),
+            json!({"name": "new"}),
+        ),
+        (
+            "DELETE",
+            format!("/api/apps/{}/keys/{key_id}", common::APP_ID),
+            Value::Null,
+        ),
+    ] {
+        let error = json_response(
+            &manager,
+            request(method, &path, "alice", body),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+        assert_eq!(error, json!({"error": "invalid storage record"}));
+    }
+}
+
+#[tokio::test]
 async fn issue_use_isolate_and_revoke() {
     let (store, manager) = setup().await;
     let (app, key, token) = create(&manager).await;
-    let auth = authz_router(Authorizer::new(store.clone(), Duration::ZERO, 16));
+    let auth = authz_router(Authorizer::new(
+        store.clone(),
+        common::config(),
+        Duration::ZERO,
+        16,
+    ));
     assert_eq!(check(&auth, app, &token).await, StatusCode::OK);
     assert_eq!(
         check(&auth, Uuid::new_v4(), &token).await,
@@ -171,6 +452,92 @@ async fn issue_use_isolate_and_revoke() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn previously_issued_base64url_keys_still_authorize_and_can_be_revoked() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let (store, manager) = setup().await;
+    let app = common::APP_ID;
+    let token = format!("kg-{}", URL_SAFE_NO_PAD.encode([0xfb; 32]));
+    assert_eq!(token.len(), 46);
+    assert!(token[3..].contains('-'));
+    assert!(token.contains('_'));
+    let (mut key, _) = keygate::model::issue("alice".into(), "legacy script".into());
+    key.digest = keygate::model::digest(&token);
+    let key_id = key.id;
+    store
+        .put(
+            &Application {
+                id: app,
+                name: "Codex".into(),
+                keys: vec![key],
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    let auth = authz_router(Authorizer::new(store, common::config(), Duration::ZERO, 16));
+    assert_eq!(check(&auth, app, &token).await, StatusCode::OK);
+    let (_, _, fresh) = create(&manager).await;
+    assert_eq!(fresh.len(), 49);
+    assert!(
+        fresh
+            .strip_prefix("kg-")
+            .unwrap()
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic())
+    );
+    assert_eq!(check(&auth, app, &fresh).await, StatusCode::OK);
+    json_response(
+        &manager,
+        request(
+            "DELETE",
+            &format!("/api/apps/{app}/keys/{key_id}"),
+            "alice",
+            Value::Null,
+        ),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(check(&auth, app, &token).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(check(&auth, app, &fresh).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn nonalphabetic_new_length_tokens_cannot_authorize_even_with_stored_digests() {
+    let (store, _) = setup().await;
+    let tokens: Vec<_> = ['0', '-', '_']
+        .into_iter()
+        .map(|invalid| format!("kg-{}{invalid}", "A".repeat(45)))
+        .collect();
+    let keys = tokens
+        .iter()
+        .map(|token| {
+            let (mut key, _) = keygate::model::issue("alice".into(), "invalid stored key".into());
+            key.digest = keygate::model::digest(token);
+            key
+        })
+        .collect();
+    let app = common::APP_ID;
+    store
+        .put(
+            &Application {
+                id: app,
+                name: "Codex".into(),
+                keys,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    let auth = authz_router(Authorizer::new(store, common::config(), Duration::ZERO, 16));
+    for token in tokens {
+        assert_eq!(token.len(), 49);
+        assert_eq!(check(&auth, app, &token).await, StatusCode::UNAUTHORIZED);
+    }
+}
+
 #[tokio::test]
 async fn rejects_untrusted_identity_and_csrf() {
     let (_, manager) = setup().await;
@@ -179,11 +546,21 @@ async fn rejects_untrusted_identity_and_csrf() {
         req.headers_mut().remove(name);
         json_response(&manager, req, StatusCode::UNAUTHORIZED).await;
     }
-    let mut req = request("POST", "/api/apps", "alice", json!({"name":"bad"}));
+    let mut req = request(
+        "POST",
+        &format!("/api/apps/{}/keys", common::APP_ID),
+        "alice",
+        json!({"name":"bad"}),
+    );
     req.headers_mut()
         .insert("origin", "https://evil.example".parse().unwrap());
     json_response(&manager, req, StatusCode::FORBIDDEN).await;
-    let mut req = request("POST", "/api/apps", "alice", json!({"name":"bad"}));
+    let mut req = request(
+        "POST",
+        &format!("/api/apps/{}/keys", common::APP_ID),
+        "alice",
+        json!({"name":"bad"}),
+    );
     req.headers_mut().remove("x-keygate-csrf");
     json_response(&manager, req, StatusCode::FORBIDDEN).await;
     let mut req = request("GET", "/api/apps", "alice", Value::Null);
@@ -197,10 +574,16 @@ async fn separate_nodes_observe_revocation_after_absolute_cache_expiry() {
     let (app, key, token) = create(&manager).await;
     let a = authz_router(Authorizer::new(
         store.clone(),
+        common::config(),
         Duration::from_millis(150),
         16,
     ));
-    let b = authz_router(Authorizer::new(store, Duration::from_millis(150), 16));
+    let b = authz_router(Authorizer::new(
+        store,
+        common::config(),
+        Duration::from_millis(150),
+        16,
+    ));
     assert_eq!(check(&a, app, &token).await, StatusCode::OK);
     assert_eq!(check(&b, app, &token).await, StatusCode::OK);
     json_response(
@@ -248,6 +631,7 @@ async fn storage_outage_does_not_extend_cached_authorization() {
     });
     let auth = authz_router(Authorizer::new(
         store.clone(),
+        common::config(),
         Duration::from_millis(150),
         16,
     ));
@@ -271,7 +655,7 @@ async fn real_envoy_authorization_and_streaming() {
     }
     let (store, manager) = setup().await;
     let (app, key, token) = create(&manager).await;
-    let authz = authz_router(Authorizer::new(store, Duration::ZERO, 16));
+    let authz = authz_router(Authorizer::new(store, common::config(), Duration::ZERO, 16));
     let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_port = auth_listener.local_addr().unwrap().port();
     let auth_task = tokio::spawn(async move { axum::serve(auth_listener, authz).await.unwrap() });
@@ -457,7 +841,12 @@ async fn all_routes_security_headers_and_input_boundaries() {
         format!("/check/{app}"),
         format!("/check/{app}/"),
     ] {
-        let router = authz_router(Authorizer::new(store.clone(), Duration::ZERO, 16));
+        let router = authz_router(Authorizer::new(
+            store.clone(),
+            common::config(),
+            Duration::ZERO,
+            16,
+        ));
         let response = router
             .oneshot(
                 Request::builder()
@@ -478,14 +867,19 @@ async fn all_routes_security_headers_and_input_boundaries() {
     ] {
         json_response(
             &manager,
-            request("POST", "/api/apps", "alice", json!({"name":bad})),
+            request(
+                "POST",
+                &format!("/api/apps/{app}/keys"),
+                "alice",
+                json!({"name":bad}),
+            ),
             StatusCode::BAD_REQUEST,
         )
         .await;
     }
     let mut req = request(
         "POST",
-        "/api/apps",
+        &format!("/api/apps/{app}/keys"),
         "alice",
         json!({"name":"x".repeat(16384)}),
     );
@@ -555,14 +949,30 @@ async fn all_routes_security_headers_and_input_boundaries() {
         StatusCode::NOT_FOUND,
     )
     .await;
-    assert!(Manager::new(store.clone(), "short".into(), "http://localhost".into()).is_err());
+    assert!(
+        Manager::new(
+            store.clone(),
+            common::config(),
+            "short".into(),
+            "http://localhost".into()
+        )
+        .is_err()
+    );
     for origin in [
         "not a URL",
         "https://example.com/path",
         "https://example.com/",
         "ftp://example.com",
     ] {
-        assert!(Manager::new(store.clone(), SECRET.into(), origin.into()).is_err());
+        assert!(
+            Manager::new(
+                store.clone(),
+                common::config(),
+                SECRET.into(),
+                origin.into()
+            )
+            .is_err()
+        );
     }
 }
 
@@ -570,7 +980,7 @@ async fn all_routes_security_headers_and_input_boundaries() {
 async fn malformed_and_duplicate_credentials_never_authorize() {
     let (store, manager) = setup().await;
     let (app, _, token) = create(&manager).await;
-    let auth = authz_router(Authorizer::new(store, Duration::ZERO, 16));
+    let auth = authz_router(Authorizer::new(store, common::config(), Duration::ZERO, 16));
     for value in [
         None,
         Some("Basic abc"),
@@ -639,6 +1049,7 @@ async fn manager_storage_errors_are_sanitized_and_do_not_issue_keys() {
                     inner: store.clone(),
                     conflict,
                 }),
+                common::config(),
                 SECRET.into(),
                 "http://localhost:8080".into(),
             )
@@ -650,7 +1061,6 @@ async fn manager_storage_errors_are_sanitized_and_do_not_issue_keys() {
             StatusCode::SERVICE_UNAVAILABLE
         };
         for (method, path, body) in [
-            ("POST", "/api/apps".into(), json!({"name":"new"})),
             (
                 "POST",
                 format!("/api/apps/{app}/keys"),
@@ -676,14 +1086,9 @@ async fn authenticated_user_identity_comes_from_storage_not_client_headers() {
     shared_users(store, manager).await;
 }
 async fn shared_users(store: Arc<dyn Store>, manager: Router) {
-    let auth = authz_router(Authorizer::new(store, Duration::ZERO, 16));
-    let app = json_response(
-        &manager,
-        request("POST", "/api/apps", "alice", json!({"name":"shared"})),
-        StatusCode::CREATED,
-    )
-    .await;
-    let id = app["id"].as_str().unwrap();
+    let auth = authz_router(Authorizer::new(store, common::config(), Duration::ZERO, 16));
+    let app = common::APP_ID.to_string();
+    let id = app.as_str();
     let mut keys = Vec::new();
     for owner in ["alice", "bob"] {
         let issued = json_response(
@@ -803,6 +1208,7 @@ async fn failed_ownership_lookup_and_invalid_key_name_cannot_mutate_storage() {
                 inner: store,
                 fail: AtomicBool::new(true),
             }),
+            common::config(),
             SECRET.into(),
             "http://localhost:8080".into(),
         )
@@ -840,17 +1246,35 @@ async fn postgres_shared_user_management_and_authorization() {
     pg.initialize().await.unwrap();
     let store: Arc<dyn Store> = Arc::new(pg);
     let manager = manager_router(
-        Manager::new(store.clone(), SECRET.into(), "http://localhost:8080".into()).unwrap(),
+        Manager::new(
+            store.clone(),
+            common::config(),
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
     );
     shared_users(store, manager).await;
 }
 
 #[tokio::test]
 async fn opaque_key_cannot_cross_application_scope() {
-    let (store, manager) = setup().await;
-    let (first, _, first_token) = create(&manager).await;
-    let (second, _, second_token) = create(&manager).await;
-    let auth = authz_router(Authorizer::new(store, Duration::ZERO, 16));
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let config = common::config_for(&[(first_id, "First"), (second_id, "Second")]);
+    let store: Arc<dyn Store> = Arc::new(common::Memory::default());
+    let manager = manager_router(
+        Manager::new(
+            store.clone(),
+            config.clone(),
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
+    );
+    let (first, _, first_token) = issue_for(&manager, first_id).await;
+    let (second, _, second_token) = issue_for(&manager, second_id).await;
+    let auth = authz_router(Authorizer::new(store, config, Duration::ZERO, 16));
     assert_eq!(check(&auth, first, &first_token).await, StatusCode::OK);
     assert_eq!(check(&auth, second, &second_token).await, StatusCode::OK);
     assert_eq!(

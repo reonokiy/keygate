@@ -75,9 +75,14 @@ async fn verifies_forwarded_id_token_and_rejects_forged_subject() {
     let store = Arc::new(common::Memory::default());
     let secret = "test-proxy-secret-at-least-32-bytes-long";
     let app = manager_router(
-        Manager::new(store, secret.into(), "http://localhost:8080".into())
-            .unwrap()
-            .with_oidc(verifier),
+        Manager::new(
+            store,
+            common::config(),
+            secret.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap()
+        .with_oidc(verifier),
     );
     let response = app
         .clone()

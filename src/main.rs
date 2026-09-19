@@ -1,6 +1,8 @@
 use clap::{Parser, ValueEnum};
 use keygate::{
-    Authorizer, Manager, authz_router, manager_router,
+    Authorizer, Manager, authz_router,
+    config::Config,
+    manager_router,
     store::{PostgresStore, Store},
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -17,6 +19,9 @@ struct Args {
     mode: Mode,
     #[arg(long, env = "KEYGATE_DATABASE_URL", hide_env_values = true)]
     database_url: String,
+    /// Administrator-managed JSON application catalog, shared with every authz instance.
+    #[arg(long, env = "KEYGATE_CONFIG")]
+    config: PathBuf,
     #[arg(long, env = "KEYGATE_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
     #[arg(long, env = "KEYGATE_OIDC_AUDIENCE")]
@@ -77,6 +82,10 @@ async fn main() -> anyhow::Result<()> {
         args.cache_ttl_seconds <= 300 && args.cache_capacity > 0,
         "cache TTL must be <= 300 seconds and capacity must be positive"
     );
+    let document = tokio::fs::read_to_string(&args.config)
+        .await
+        .map_err(|_| anyhow::anyhow!("could not read application configuration"))?;
+    let config = Arc::new(Config::parse(&document)?);
     let database = PostgresStore::open(&args.database_url)
         .await
         .map_err(|_| anyhow::anyhow!("database connection failed"))?;
@@ -89,14 +98,15 @@ async fn main() -> anyhow::Result<()> {
     let store: Arc<dyn Store> = Arc::new(database);
     let authz = authz_router(Authorizer::new(
         store.clone(),
+        config.clone(),
         Duration::from_secs(args.cache_ttl_seconds),
         args.cache_capacity,
     ));
     match args.mode {
         Mode::Authz => serve(args.authz_listen, authz).await,
-        Mode::Manager => serve(args.manager_listen, manager(&args, store).await?).await,
+        Mode::Manager => serve(args.manager_listen, manager(&args, store, config).await?).await,
         Mode::All => {
-            let manager = manager(&args, store).await?;
+            let manager = manager(&args, store, config).await?;
             tokio::try_join!(
                 serve(args.manager_listen, manager),
                 serve(args.authz_listen, authz)
@@ -105,14 +115,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 }
-async fn manager(args: &Args, store: Arc<dyn Store>) -> anyhow::Result<axum::Router> {
+async fn manager(
+    args: &Args,
+    store: Arc<dyn Store>,
+    config: Arc<Config>,
+) -> anyhow::Result<axum::Router> {
     let secret = tokio::fs::read_to_string(
         args.proxy_secret_file
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--proxy-secret-file is required for manager"))?,
     )
     .await?;
-    let mut manager = Manager::new(store, secret.trim().into(), args.public_origin.clone())?;
+    let mut manager = Manager::new(
+        store,
+        config,
+        secret.trim().into(),
+        args.public_origin.clone(),
+    )?;
     if !args.trust_subject_header {
         manager = manager.with_oidc(keygate::identity::Oidc::new(
             args.oidc_issuer
