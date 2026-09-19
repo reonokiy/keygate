@@ -18,7 +18,7 @@ async function action(button, callback) {
 async function refresh() {
   const apps = await api('/api/apps');
   $('#apps').replaceChildren();
-  if (!apps.length) $('#apps').append(node('p','还没有应用。创建第一个应用后即可生成密钥。','empty'));
+  if (!apps.length) $('#apps').append(node('p','还没有共享应用。创建应用后，每位用户都能为它生成自己的 API key。','empty'));
   for (const app of apps) {
     const card = node('article',null,'card'); card.append(node('h2',app.name),node('code',app.id));
     const form = node('form'); form.className = 'row key-form';
@@ -28,6 +28,8 @@ async function refresh() {
       const result = await api(`/api/apps/${app.id}/keys`,'POST',{name:input.value});
       $('#new-key').value = result.key; $('#key-dialog').showModal(); input.value = ''; await refresh();
     }); }); card.append(form);
+    card.append(node('h3','我的 API key'));
+    if (!app.keys.length) card.append(node('p','你还没有为这个应用生成 API key。','empty'));
     const list = node('ul');
     for (const key of app.keys) {
       const li = node('li'); const info = node('div'); info.append(node('strong',key.name),node('small',`${new Date(key.created_at*1000).toLocaleString()} · ${key.revoked ? '已撤销' : '有效'}`)); li.append(info);

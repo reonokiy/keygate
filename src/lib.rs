@@ -1,3 +1,4 @@
+mod http;
 pub mod identity;
 pub mod model;
 pub mod store;
@@ -163,7 +164,7 @@ pub fn manager_router(s: Manager) -> Router {
             "/api/me",
             get(
                 |axum::Extension(id): axum::Extension<Identity>| async move {
-                    Json(json!({"subject":id.0}))
+                    Json(json!({"subject":id.0,"user_id":model::user_id(&id.0)}))
                 },
             ),
         )
@@ -176,8 +177,8 @@ pub fn manager_router(s: Manager) -> Router {
         .layer(middleware::from_fn(secure_response))
         .with_state(s)
 }
-fn public_app(app: &Application) -> Value {
-    json!({"id":app.id,"name":app.name,"keys":app.keys.iter().map(|k| json!({"id":k.id,"name":k.name,"created_at":k.created_at,"revoked":k.revoked})).collect::<Vec<_>>()})
+fn public_app(app: &Application, owner: &str) -> Value {
+    json!({"id":app.id,"name":app.name,"keys":app.keys.iter().filter(|k| k.owner == owner).map(|k| json!({"id":k.id,"name":k.name,"created_at":k.created_at,"revoked":k.revoked})).collect::<Vec<_>>()})
 }
 #[derive(Deserialize)]
 struct Named {
@@ -200,8 +201,7 @@ async fn list_apps(
     let apps = s.store.list().await?;
     Ok(Json(json!(
         apps.iter()
-            .filter(|a| a.app.owner == id.0)
-            .map(|a| public_app(&a.app))
+            .map(|a| public_app(&a.app, &id.0))
             .collect::<Vec<_>>()
     )))
 }
@@ -212,18 +212,17 @@ async fn create_app(
 ) -> Result<(StatusCode, Json<Value>), Error> {
     let app = Application {
         id: Uuid::new_v4(),
-        owner: id.0,
         name: name(body.name)?,
         keys: vec![],
     };
     s.store.put(&app, 0).await?;
-    Ok((StatusCode::CREATED, Json(public_app(&app))))
+    Ok((StatusCode::CREATED, Json(public_app(&app, &id.0))))
 }
-async fn owned(s: &Manager, app: Uuid, owner: &str) -> Result<Versioned, Error> {
+async fn application(s: &Manager, app: Uuid) -> Result<Versioned, Error> {
     s.store
         .get(app)
         .await?
-        .filter(|a| a.app.owner == owner)
+        .filter(|a| a.app.id == app)
         .ok_or(Error(StatusCode::NOT_FOUND, "application not found"))
 }
 async fn create_key(
@@ -232,11 +231,11 @@ async fn create_key(
     Path(app): Path<Uuid>,
     Json(body): Json<Named>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
-    let mut entry = owned(&s, app, &id.0).await?;
-    if entry.app.keys.len() >= 1000 {
-        return Err(Error(StatusCode::CONFLICT, "application key limit reached"));
+    let mut entry = application(&s, app).await?;
+    if entry.app.keys.iter().filter(|k| k.owner == id.0).count() >= 1000 {
+        return Err(Error(StatusCode::CONFLICT, "user key limit reached"));
     }
-    let (key, token) = model::issue(app, name(body.name)?);
+    let (key, token) = model::issue(id.0, name(body.name)?);
     let key_id = key.id;
     entry.app.keys.push(key);
     s.store.put(&entry.app, entry.version).await?;
@@ -247,12 +246,12 @@ async fn revoke_key(
     axum::Extension(id): axum::Extension<Identity>,
     Path((app, key)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, Error> {
-    let mut entry = owned(&s, app, &id.0).await?;
+    let mut entry = application(&s, app).await?;
     let key = entry
         .app
         .keys
         .iter_mut()
-        .find(|k| k.id == key)
+        .find(|k| k.id == key && k.owner == id.0)
         .ok_or(Error(StatusCode::NOT_FOUND, "key not found"))?;
     if !key.revoked {
         key.revoked = true;
@@ -308,6 +307,12 @@ impl Authorizer {
         let Some(item) = item else {
             return Ok(None);
         };
+        if item.app.id != id || item.version == 0 {
+            return Err(Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "invalid storage record",
+            ));
+        }
         let app = Arc::new(item.app);
         if !self.ttl.is_zero() {
             self.cache
@@ -351,27 +356,27 @@ async fn authorize(s: Authorizer, expected: Uuid, headers: HeaderMap) -> Result<
     let token = header(&headers, "authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(Error(StatusCode::UNAUTHORIZED, "API key required"))?;
-    let (app, key) =
-        model::parse_token(token).ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
-    if app != expected {
-        return Err(Error(
-            StatusCode::FORBIDDEN,
-            "key is for another application",
-        ));
-    }
-    let app = s
-        .app(app)
-        .await?
-        .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
-    if !model::validates(&app, key, token) {
+    if !model::valid_token(token) {
         return Err(Error(StatusCode::UNAUTHORIZED, "invalid API key"));
     }
+    let app = s
+        .app(expected)
+        .await?
+        .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
+    let authenticated = model::authenticate(&app, token)
+        .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
     Ok((
         StatusCode::OK,
         [
+            ("x-auth-request-user", model::user_id(&authenticated.owner)),
+            ("x-keygate-user-id", model::user_id(&authenticated.owner)),
             ("x-keygate-app", app.id.to_string()),
-            ("x-keygate-key-id", key.to_string()),
+            ("x-keygate-key-id", authenticated.id.to_string()),
         ],
     )
         .into_response())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/cache.rs"]
+mod cache_tests;

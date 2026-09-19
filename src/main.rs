@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use keygate::{
     Authorizer, Manager, authz_router, manager_router,
-    store::{OpenBaoStore, SqliteStore, Store},
+    store::{PostgresStore, Store},
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 #[derive(Clone, ValueEnum)]
@@ -10,36 +10,13 @@ enum Mode {
     Authz,
     All,
 }
-#[derive(Clone, ValueEnum)]
-enum Backend {
-    Sqlite,
-    Openbao,
-}
 #[derive(Parser)]
 #[command(version, about = "API key management and Envoy external authorization")]
 struct Args {
     #[arg(long, env = "KEYGATE_MODE", default_value = "all")]
     mode: Mode,
-    #[arg(long, env = "KEYGATE_BACKEND", default_value = "sqlite")]
-    backend: Backend,
-    #[arg(
-        long,
-        env = "KEYGATE_SQLITE_URL",
-        default_value = "sqlite://keygate.db"
-    )]
-    sqlite_url: String,
-    #[arg(
-        long,
-        env = "KEYGATE_BAO_ADDR",
-        default_value = "http://127.0.0.1:8200"
-    )]
-    bao_addr: String,
-    #[arg(long, env = "KEYGATE_BAO_MOUNT", default_value = "kv")]
-    bao_mount: String,
-    #[arg(long, env = "KEYGATE_BAO_PREFIX", default_value = "keygate")]
-    bao_prefix: String,
-    #[arg(long, env = "KEYGATE_BAO_TOKEN_FILE")]
-    bao_token_file: Option<PathBuf>,
+    #[arg(long, env = "KEYGATE_DATABASE_URL", hide_env_values = true)]
+    database_url: String,
     #[arg(long, env = "KEYGATE_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
     #[arg(long, env = "KEYGATE_OIDC_AUDIENCE")]
@@ -100,50 +77,54 @@ async fn main() -> anyhow::Result<()> {
         args.cache_ttl_seconds <= 300 && args.cache_capacity > 0,
         "cache TTL must be <= 300 seconds and capacity must be positive"
     );
-    let store: Arc<dyn Store> = match args.backend {
-        Backend::Sqlite => Arc::new(SqliteStore::open(&args.sqlite_url).await?),
-        Backend::Openbao => Arc::new(OpenBaoStore::new(
-            &args.bao_addr,
-            &args.bao_mount,
-            &args.bao_prefix,
-            args.bao_token_file
-                .ok_or_else(|| anyhow::anyhow!("--bao-token-file is required"))?,
-        )?),
-    };
+    let database = PostgresStore::open(&args.database_url)
+        .await
+        .map_err(|_| anyhow::anyhow!("database connection failed"))?;
+    if !matches!(args.mode, Mode::Authz) {
+        database
+            .initialize()
+            .await
+            .map_err(|_| anyhow::anyhow!("database initialization failed"))?;
+    }
+    let store: Arc<dyn Store> = Arc::new(database);
     let authz = authz_router(Authorizer::new(
         store.clone(),
         Duration::from_secs(args.cache_ttl_seconds),
         args.cache_capacity,
     ));
-    if matches!(args.mode, Mode::Authz) {
-        return serve(args.authz_listen, authz).await;
-    }
-    let secret = tokio::fs::read_to_string(
-        args.proxy_secret_file
-            .ok_or_else(|| anyhow::anyhow!("--proxy-secret-file is required for manager"))?,
-    )
-    .await?;
-    let mut manager = Manager::new(store, secret.trim().into(), args.public_origin)?;
-    if !args.trust_subject_header {
-        manager = manager.with_oidc(keygate::identity::Oidc::new(
-            args.oidc_issuer
-                .ok_or_else(|| anyhow::anyhow!("--oidc-issuer is required"))?,
-            args.oidc_audience
-                .ok_or_else(|| anyhow::anyhow!("--oidc-audience is required"))?,
-            args.oidc_jwks_url
-                .ok_or_else(|| anyhow::anyhow!("--oidc-jwks-url is required"))?,
-        )?);
-    }
-    let manager = manager_router(manager);
     match args.mode {
-        Mode::Manager => serve(args.manager_listen, manager).await,
+        Mode::Authz => serve(args.authz_listen, authz).await,
+        Mode::Manager => serve(args.manager_listen, manager(&args, store).await?).await,
         Mode::All => {
+            let manager = manager(&args, store).await?;
             tokio::try_join!(
                 serve(args.manager_listen, manager),
                 serve(args.authz_listen, authz)
             )?;
             Ok(())
         }
-        Mode::Authz => unreachable!(),
     }
+}
+async fn manager(args: &Args, store: Arc<dyn Store>) -> anyhow::Result<axum::Router> {
+    let secret = tokio::fs::read_to_string(
+        args.proxy_secret_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--proxy-secret-file is required for manager"))?,
+    )
+    .await?;
+    let mut manager = Manager::new(store, secret.trim().into(), args.public_origin.clone())?;
+    if !args.trust_subject_header {
+        manager = manager.with_oidc(keygate::identity::Oidc::new(
+            args.oidc_issuer
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--oidc-issuer is required"))?,
+            args.oidc_audience
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--oidc-audience is required"))?,
+            args.oidc_jwks_url
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--oidc-jwks-url is required"))?,
+        )?);
+    }
+    Ok(manager_router(manager))
 }

@@ -1,5 +1,8 @@
 //! Envoy owns the OAuth session. Verify the forwarded ID token as an additional trust check.
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    jwk::{JwkSet, KeyOperations, PublicKeyUse},
+};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -13,11 +16,13 @@ pub struct Oidc {
     issuer: String,
     audience: String,
     jwks_url: String,
-    cache: Mutex<Option<(Instant, JwkSet)>>,
+    cache: Mutex<Option<(Instant, Result<JwkSet, ()>)>>,
 }
 #[derive(Deserialize)]
 struct Claims {
     sub: String,
+    aud: serde_json::Value,
+    azp: Option<String>,
 }
 impl Oidc {
     pub fn new(issuer: String, audience: String, jwks_url: String) -> anyhow::Result<Self> {
@@ -30,7 +35,11 @@ impl Oidc {
                 "OIDC endpoints require HTTPS except loopback tests"
             );
             anyhow::ensure!(
-                url.username().is_empty() && url.password().is_none(),
+                url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host_str().is_some()
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
                 "OIDC endpoint cannot contain credentials"
             );
         }
@@ -64,33 +73,48 @@ impl Oidc {
         }
         let kid = header.kid.ok_or(IdentityError::Invalid)?;
         let mut cache = self.cache.lock().await;
-        // Refresh at most once a minute, including unknown key IDs, to bound IdP load.
-        if cache
-            .as_ref()
-            .is_none_or(|(time, _)| time.elapsed() >= Duration::from_secs(60))
-        {
+        // Successful JWKS fetches live for 60s. Cache failures for 5s so an IdP
+        // outage cannot turn every login request into a new outbound request.
+        let fresh = cache.as_ref().is_some_and(|(at, result)| {
+            at.elapsed() < Duration::from_secs(if result.is_ok() { 60 } else { 5 })
+        });
+        if !fresh {
             let started = Instant::now();
-            let response = self
-                .client
-                .get(&self.jwks_url)
-                .send()
-                .await
-                .map_err(|_| IdentityError::Unavailable)?;
-            if !response.status().is_success() {
-                return Err(IdentityError::Unavailable);
-            }
-            let keys: JwkSet = response
-                .json()
-                .await
-                .map_err(|_| IdentityError::Unavailable)?;
-            *cache = Some((started, keys));
+            let result = match self.client.get(&self.jwks_url).send().await {
+                Ok(response) if response.status().is_success() => crate::http::json(response).await,
+                _ => Err(()),
+            };
+            *cache = Some((started, result));
         }
-        let jwk = cache
+        let keys = cache
             .as_ref()
             .unwrap()
             .1
-            .find(&kid)
-            .ok_or(IdentityError::Invalid)?;
+            .as_ref()
+            .map_err(|_| IdentityError::Unavailable)?;
+        let mut matching = keys
+            .keys
+            .iter()
+            .filter(|jwk| jwk.common.key_id.as_deref() == Some(&kid));
+        let jwk = matching.next().ok_or(IdentityError::Invalid)?;
+        if matching.next().is_some()
+            || jwk
+                .common
+                .public_key_use
+                .as_ref()
+                .is_some_and(|usage| *usage != PublicKeyUse::Signature)
+            || jwk
+                .common
+                .key_operations
+                .as_ref()
+                .is_some_and(|ops| !ops.contains(&KeyOperations::Verify))
+            || jwk
+                .common
+                .key_algorithm
+                .is_some_and(|alg| alg.to_string() != format!("{:?}", header.alg))
+        {
+            return Err(IdentityError::Invalid);
+        }
         let key = DecodingKey::from_jwk(jwk).map_err(|_| IdentityError::Invalid)?;
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&self.issuer]);
@@ -101,9 +125,18 @@ impl Oidc {
         let claims = decode::<Claims>(token, &key, &validation)
             .map_err(|_| IdentityError::Invalid)?
             .claims;
-        if claims.sub.is_empty() || claims.sub.len() > 512 {
+        let multiple_audiences = claims.aud.as_array().is_some_and(|aud| aud.len() > 1);
+        if (multiple_audiences && claims.azp.is_none())
+            || claims.azp.as_ref().is_some_and(|azp| azp != &self.audience)
+            || claims.sub.is_empty()
+            || claims.sub.len() > 512
+        {
             return Err(IdentityError::Invalid);
         }
         Ok(claims.sub)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/identity.rs"]
+mod tests;

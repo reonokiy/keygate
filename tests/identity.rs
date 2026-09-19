@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     Json, Router,
     body::Body,
@@ -6,7 +7,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use keygate::{Manager, identity::Oidc, manager_router, store::SqliteStore};
+use keygate::{Manager, identity::Oidc, manager_router};
 use ring::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
@@ -71,7 +72,7 @@ async fn verifies_forwarded_id_token_and_rejects_forged_subject() {
     )
     .unwrap();
     assert!(verifier.subject(&hmac).await.is_err());
-    let store = Arc::new(SqliteStore::open("sqlite::memory:").await.unwrap());
+    let store = Arc::new(common::Memory::default());
     let secret = "test-proxy-secret-at-least-32-bytes-long";
     let app = manager_router(
         Manager::new(store, secret.into(), "http://localhost:8080".into())
@@ -108,7 +109,7 @@ async fn verifies_forwarded_id_token_and_rejects_forged_subject() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-        json!({"subject":"alice"})
+        json!({"subject":"alice","user_id":keygate::model::user_id("alice")})
     );
     task.abort();
 }

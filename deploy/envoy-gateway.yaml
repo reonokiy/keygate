@@ -70,4 +70,4 @@ spec:
       path: /check/REPLACE_APPLICATION_UUID
       backendRefs:
         - {group: gateway.envoyproxy.io, kind: Backend, name: keygate-authz-local, port: 8081}
-      headersToBackend: [x-keygate-app, x-keygate-key-id]
+      headersToBackend: [x-auth-request-user, x-keygate-user-id, x-keygate-app, x-keygate-key-id]

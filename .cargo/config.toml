@@ -1,2 +1,5 @@
 [alias]
 test-all = "test --locked -- --include-ignored"
+# Total line coverage of 100% also requires every source file to be fully covered.
+# cargo-llvm-cov 0.9.1 compares its per-file threshold with > rather than >=.
+coverage = "llvm-cov --locked --html --fail-under-lines 100 --fail-under-functions 100 -- --include-ignored"

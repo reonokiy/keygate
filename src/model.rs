@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -6,12 +7,12 @@ use uuid::Uuid;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Application {
     pub id: Uuid,
-    pub owner: String,
     pub name: String,
     pub keys: Vec<Key>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Key {
+    pub owner: String,
     pub id: Uuid,
     pub name: String,
     pub digest: String,
@@ -26,20 +27,20 @@ pub struct Versioned {
 pub fn digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
+/// Stable, header-safe identifier for the configured identity provider's subject.
+pub fn user_id(subject: &str) -> String {
+    format!("usr_{}", digest(subject))
+}
 pub fn constant_eq(a: &str, b: &str) -> bool {
     bool::from(digest(a).as_bytes().ct_eq(digest(b).as_bytes()))
 }
-pub fn issue(app: Uuid, name: String) -> (Key, String) {
+pub fn issue(owner: String, name: String) -> (Key, String) {
     let id = Uuid::new_v4();
     let mut secret = [0u8; 32];
     OsRng.fill_bytes(&mut secret);
-    let token = format!(
-        "kgt_{}_{}_{}",
-        app.simple(),
-        id.simple(),
-        hex::encode(secret)
-    );
+    let token = format!("kg-{}", URL_SAFE_NO_PAD.encode(secret));
     let key = Key {
+        owner,
         id,
         name,
         digest: digest(&token),
@@ -51,28 +52,20 @@ pub fn issue(app: Uuid, name: String) -> (Key, String) {
     };
     (key, token)
 }
-pub fn parse_token(token: &str) -> Option<(Uuid, Uuid)> {
-    if token.len() != 134 {
-        return None;
-    }
-    let p: Vec<_> = token.split('_').collect();
-    if p.len() != 4
-        || p[0] != "kgt"
-        || p[1].len() != 32
-        || p[2].len() != 32
-        || p[3].len() != 64
-        || !p[1..].iter().all(|s| {
-            s.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+/// Exactly 32 random bytes in canonical, unpadded base64url.
+pub fn valid_token(token: &str) -> bool {
+    token.len() == 46
+        && token.strip_prefix("kg-").is_some_and(|secret| {
+            URL_SAFE_NO_PAD
+                .decode(secret)
+                .is_ok_and(|bytes| bytes.len() == 32)
         })
-    {
-        return None;
-    }
-    Some((Uuid::parse_str(p[1]).ok()?, Uuid::parse_str(p[2]).ok()?))
 }
-pub fn validates(app: &Application, id: Uuid, token: &str) -> bool {
+pub fn authenticate<'a>(app: &'a Application, token: &str) -> Option<&'a Key> {
     let supplied = digest(token);
-    app.keys.iter().any(|k| {
-        k.id == id && !k.revoked && bool::from(k.digest.as_bytes().ct_eq(supplied.as_bytes()))
+    app.keys.iter().find(|k| {
+        !k.owner.is_empty()
+            && !k.revoked
+            && bool::from(k.digest.as_bytes().ct_eq(supplied.as_bytes()))
     })
 }

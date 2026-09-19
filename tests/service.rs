@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     Router,
     body::Body,
@@ -7,7 +8,7 @@ use http_body_util::BodyExt;
 use keygate::{
     Authorizer, Manager, authz_router, manager_router,
     model::{Application, Versioned},
-    store::{OpenBaoStore, SqliteStore, Store, StoreError},
+    store::{Store, StoreError},
 };
 use serde_json::{Value, json};
 use std::{
@@ -44,7 +45,7 @@ async fn json_response(app: &Router, req: Request<Body>, expected: StatusCode) -
     }
 }
 async fn setup() -> (Arc<dyn Store>, Router) {
-    let store: Arc<dyn Store> = Arc::new(SqliteStore::open("sqlite::memory:").await.unwrap());
+    let store: Arc<dyn Store> = Arc::new(common::Memory::default());
     let manager = manager_router(
         Manager::new(store.clone(), SECRET.into(), "http://localhost:8080".into()).unwrap(),
     );
@@ -96,7 +97,7 @@ async fn issue_use_isolate_and_revoke() {
     assert_eq!(check(&auth, app, &token).await, StatusCode::OK);
     assert_eq!(
         check(&auth, Uuid::new_v4(), &token).await,
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
     let mut bad = token.clone();
     bad.pop();
@@ -123,16 +124,16 @@ async fn issue_use_isolate_and_revoke() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(bob, json!([]));
+    assert_eq!(bob[0]["keys"], json!([]));
     json_response(
         &manager,
         request(
             "POST",
             &format!("/api/apps/{app}/keys"),
             "bob",
-            json!({"name":"stolen"}),
+            json!({"name":"own"}),
         ),
-        StatusCode::NOT_FOUND,
+        StatusCode::CREATED,
     )
     .await;
     json_response(
@@ -258,252 +259,6 @@ async fn storage_outage_does_not_extend_cached_authorization() {
         StatusCode::SERVICE_UNAVAILABLE
     );
 }
-async fn cas_contract(store: Arc<dyn Store>) {
-    let mut app = Application {
-        id: Uuid::new_v4(),
-        owner: "alice".into(),
-        name: "test".into(),
-        keys: vec![],
-    };
-    store.put(&app, 0).await.unwrap();
-    assert!(matches!(
-        store.put(&app, 0).await,
-        Err(StoreError::Conflict)
-    ));
-    let first = store.get(app.id).await.unwrap().unwrap();
-    let (mut key, _) = keygate::model::issue(app.id, "key".into());
-    key.revoked = true;
-    app.keys.push(key);
-    store.put(&app, first.version).await.unwrap();
-    assert!(matches!(
-        store.put(&first.app, first.version).await,
-        Err(StoreError::Conflict)
-    ));
-    assert!(store.get(app.id).await.unwrap().unwrap().app.keys[0].revoked);
-    assert_eq!(store.list().await.unwrap().len(), 1);
-}
-#[tokio::test]
-async fn sqlite_cas_and_restart_persistence() {
-    let temp = tempfile::tempdir().unwrap();
-    let url = format!("sqlite://{}", temp.path().join("keys.db").display());
-    let store: Arc<dyn Store> = Arc::new(SqliteStore::open(&url).await.unwrap());
-    cas_contract(store).await;
-    let reopened = SqliteStore::open(&url).await.unwrap();
-    assert_eq!(reopened.list().await.unwrap().len(), 1);
-}
-
-// Wire-level KV v2 contract double. This is not a real OpenBao daemon.
-#[tokio::test]
-async fn openbao_http_contract_cas_token_reload_and_fail_closed() {
-    use axum::{
-        extract::{Path, State},
-        http::HeaderMap,
-        routing::get,
-    };
-    use std::collections::HashMap;
-    type Data = Arc<tokio::sync::Mutex<HashMap<Uuid, (u64, Value)>>>;
-    async fn read(
-        State(data): State<Data>,
-        Path(id): Path<Uuid>,
-        headers: HeaderMap,
-    ) -> (StatusCode, axum::Json<Value>) {
-        if headers
-            .get("x-vault-token")
-            .is_none_or(|v| v != "test-token")
-        {
-            return (StatusCode::FORBIDDEN, axum::Json(json!({})));
-        }
-        match data.lock().await.get(&id) {
-            Some((v, d)) => (
-                StatusCode::OK,
-                axum::Json(json!({"data":{"data":d,"metadata":{"version":v}}})),
-            ),
-            None => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
-        }
-    }
-    async fn write(
-        State(data): State<Data>,
-        Path(id): Path<Uuid>,
-        headers: HeaderMap,
-        axum::Json(body): axum::Json<Value>,
-    ) -> StatusCode {
-        if headers
-            .get("x-vault-token")
-            .is_none_or(|v| v != "test-token")
-        {
-            return StatusCode::FORBIDDEN;
-        }
-        let mut data = data.lock().await;
-        let version = data.get(&id).map_or(0, |(v, _)| *v);
-        if body["options"]["cas"].as_u64() != Some(version) {
-            return StatusCode::BAD_REQUEST;
-        }
-        data.insert(id, (version + 1, body["data"].clone()));
-        StatusCode::OK
-    }
-    async fn list(State(data): State<Data>, headers: HeaderMap) -> (StatusCode, axum::Json<Value>) {
-        if headers
-            .get("x-vault-token")
-            .is_none_or(|v| v != "test-token")
-        {
-            return (StatusCode::FORBIDDEN, axum::Json(json!({})));
-        }
-        (
-            StatusCode::OK,
-            axum::Json(
-                json!({"data":{"keys":data.lock().await.keys().map(ToString::to_string).collect::<Vec<_>>()}}),
-            ),
-        )
-    }
-    let app = Router::new()
-        .route("/v1/kv/data/keygate/apps/{id}", get(read).post(write))
-        .route("/v1/kv/metadata/keygate/apps", get(list))
-        .with_state(Data::default());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let temp = tempfile::tempdir().unwrap();
-    let token_file = temp.path().join("token");
-    tokio::fs::write(&token_file, "test-token\n").await.unwrap();
-    let store: Arc<dyn Store> = Arc::new(
-        OpenBaoStore::new(
-            &format!("http://{addr}"),
-            "kv",
-            "keygate",
-            token_file.clone(),
-        )
-        .unwrap(),
-    );
-    cas_contract(store.clone()).await;
-    tokio::fs::write(&token_file, "revoked").await.unwrap();
-    assert!(matches!(store.list().await, Err(StoreError::Unavailable)));
-    tokio::fs::write(&token_file, "test-token").await.unwrap();
-    assert_eq!(store.list().await.unwrap().len(), 1);
-    task.abort();
-    assert!(matches!(
-        store.get(Uuid::new_v4()).await,
-        Err(StoreError::Unavailable)
-    ));
-}
-
-/// Real local OpenBao, isolated from cluster credentials. Run with cargo test-all.
-#[tokio::test]
-#[ignore = "requires Docker and quay.io/openbao/openbao:2.6.1"]
-async fn real_openbao_lifecycle() {
-    use std::process::Command;
-    struct Container(String);
-    impl Drop for Container {
-        fn drop(&mut self) {
-            let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
-        }
-    }
-    let name = format!("keygate-test-{}", Uuid::new_v4());
-    let _guard = Container(name.clone());
-    let result = Command::new("docker")
-        .args([
-            "run",
-            "-d",
-            "--name",
-            &name,
-            "-p",
-            "127.0.0.1::8200",
-            "-e",
-            "BAO_DEV_ROOT_TOKEN_ID=keygate-isolated-test-only",
-            "quay.io/openbao/openbao:2.6.1",
-            "server",
-            "-dev",
-            "-dev-listen-address=0.0.0.0:8200",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "Docker failed to start isolated OpenBao"
-    );
-    let output = Command::new("docker")
-        .args(["port", &name, "8200/tcp"])
-        .output()
-        .unwrap();
-    let base = format!(
-        "http://{}",
-        String::from_utf8(output.stdout).unwrap().trim()
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    let mut ready = false;
-    for _ in 0..100 {
-        if client
-            .get(format!("{base}/v1/sys/health"))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(ready, "isolated OpenBao never became ready");
-    let response = client
-        .post(format!("{base}/v1/sys/mounts/keygate-test"))
-        .header("x-vault-token", "keygate-isolated-test-only")
-        .json(&json!({"type":"kv","options":{"version":"2"}}))
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success());
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("token");
-    tokio::fs::write(&file, "keygate-isolated-test-only")
-        .await
-        .unwrap();
-    let store: Arc<dyn Store> =
-        Arc::new(OpenBaoStore::new(&base, "keygate-test", "test", file).unwrap());
-    cas_contract(store.clone()).await;
-    let manager = manager_router(
-        Manager::new(store.clone(), SECRET.into(), "http://localhost:8080".into()).unwrap(),
-    );
-    let (app, key, token) = create(&manager).await;
-    let node_a = authz_router(Authorizer::new(
-        store.clone(),
-        Duration::from_millis(100),
-        16,
-    ));
-    let node_b = authz_router(Authorizer::new(
-        store.clone(),
-        Duration::from_millis(100),
-        16,
-    ));
-    assert_eq!(check(&node_a, app, &token).await, StatusCode::OK);
-    assert_eq!(check(&node_b, app, &token).await, StatusCode::OK);
-    let persisted = client
-        .get(format!("{base}/v1/keygate-test/data/test/apps/{app}"))
-        .header("x-vault-token", "keygate-isolated-test-only")
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(!persisted.contains(&token));
-    json_response(
-        &manager,
-        request(
-            "DELETE",
-            &format!("/api/apps/{app}/keys/{key}"),
-            "alice",
-            Value::Null,
-        ),
-        StatusCode::NO_CONTENT,
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(check(&node_a, app, &token).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(check(&node_b, app, &token).await, StatusCode::UNAUTHORIZED);
-}
-
 #[tokio::test]
 #[ignore = "requires Linux Docker host networking and envoyproxy/envoy:v1.38.4"]
 async fn real_envoy_authorization_and_streaming() {
@@ -520,9 +275,47 @@ async fn real_envoy_authorization_and_streaming() {
     let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_port = auth_listener.local_addr().unwrap().port();
     let auth_task = tokio::spawn(async move { axum::serve(auth_listener, authz).await.unwrap() });
-    let upstream = Router::new().fallback(|| async {
+    let upstream = Router::new().fallback(|headers: axum::http::HeaderMap| async move {
         (
-            [("content-type", "text/event-stream")],
+            [
+                ("content-type", "text/event-stream".to_owned()),
+                (
+                    "x-observed-auth-user",
+                    headers
+                        .get("x-auth-request-user")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ),
+                (
+                    "x-observed-user",
+                    headers
+                        .get("x-keygate-user-id")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ),
+                (
+                    "x-observed-app",
+                    headers
+                        .get("x-keygate-app")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ),
+                (
+                    "x-observed-key",
+                    headers
+                        .get("x-keygate-key-id")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ),
+            ],
             "data: ready\n\ndata: [DONE]\n\n",
         )
     });
@@ -533,8 +326,10 @@ async fn real_envoy_authorization_and_streaming() {
     let port = socket.local_addr().unwrap().port();
     drop(socket);
     let cluster = |name: &str, port: u16| json!({"name":name,"type":"STATIC","connect_timeout":"1s","load_assignment":{"cluster_name":name,"endpoints":[{"lb_endpoints":[{"endpoint":{"address":{"socket_address":{"address":"127.0.0.1","port_value":port}}}}]}]}});
-    let config = json!({"static_resources":{"listeners":[{"name":"ingress","address":{"socket_address":{"address":"127.0.0.1","port_value":port}},"filter_chains":[{"filters":[{"name":"envoy.filters.network.http_connection_manager","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","route_config":{"name":"route","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"upstream","timeout":"0s"}}]}]},"http_filters":[{"name":"envoy.filters.http.ext_authz","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz","failure_mode_allow":false,"http_service":{"server_uri":{"uri":"http://authz","cluster":"authz","timeout":"6s"},"path_prefix":format!("/check/{app}"),"authorization_request":{"allowed_headers":{"patterns":[{"exact":"authorization"}]}}}}},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]}}]}]}],"clusters":[cluster("authz",auth_port),cluster("upstream",up_port)]}});
+    let mut config = json!({"static_resources":{"listeners":[{"name":"ingress","address":{"socket_address":{"address":"127.0.0.1","port_value":port}},"filter_chains":[{"filters":[{"name":"envoy.filters.network.http_connection_manager","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","route_config":{"name":"route","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"upstream","timeout":"0s"}}]}]},"http_filters":[{"name":"envoy.filters.http.ext_authz","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz","failure_mode_allow":false,"http_service":{"server_uri":{"uri":"http://authz","cluster":"authz","timeout":"6s"},"path_prefix":format!("/check/{app}"),"authorization_request":{"allowed_headers":{"patterns":[{"exact":"authorization"}]}}}}},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]}}]}]}],"clusters":[cluster("authz",auth_port),cluster("upstream",up_port)]}});
     let temp = tempfile::tempdir().unwrap();
+    config["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        ["http_filters"][0]["typed_config"]["http_service"]["authorization_response"] = json!({"allowed_upstream_headers":{"patterns":[{"exact":"x-auth-request-user"},{"exact":"x-keygate-user-id"},{"exact":"x-keygate-app"},{"exact":"x-keygate-key-id"}]}});
     let file = temp.path().join("envoy.json");
     std::fs::write(&file, serde_json::to_vec(&config).unwrap()).unwrap();
     let name = format!("keygate-envoy-test-{}", Uuid::new_v4());
@@ -591,12 +386,26 @@ async fn real_envoy_authorization_and_streaming() {
     let response = client
         .post(&url)
         .bearer_auth(&token)
+        .header("x-auth-request-user", "forged-auth-user")
+        .header("x-keygate-user-id", "forged-user")
+        .header("x-keygate-app", "forged-app")
+        .header("x-keygate-key-id", "forged-key")
         .json(&json!({"stream":true}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert_eq!(
+        response.headers()["x-observed-user"],
+        keygate::model::user_id("alice")
+    );
+    assert_eq!(
+        response.headers()["x-observed-auth-user"],
+        response.headers()["x-observed-user"]
+    );
+    assert_eq!(response.headers()["x-observed-app"], app.to_string());
+    assert_eq!(response.headers()["x-observed-key"], key.to_string());
     assert!(response.text().await.unwrap().contains("data: [DONE]"));
     json_response(
         &manager,
@@ -621,4 +430,435 @@ async fn real_envoy_authorization_and_streaming() {
     );
     auth_task.abort();
     up_task.abort();
+}
+
+#[tokio::test]
+async fn all_routes_security_headers_and_input_boundaries() {
+    let (store, manager) = setup().await;
+    let (app, _, token) = create(&manager).await;
+    for path in ["/", "/app.js", "/style.css", "/api/me", "/healthz"] {
+        let response = manager
+            .clone()
+            .oneshot(request("GET", path, "alice", Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'")
+        );
+    }
+    for path in [
+        "/healthz".to_owned(),
+        format!("/check/{app}"),
+        format!("/check/{app}/"),
+    ] {
+        let router = authz_router(Authorizer::new(store.clone(), Duration::ZERO, 16));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for bad in [
+        "".to_owned(),
+        " ".into(),
+        "x".repeat(129),
+        "new\napp".into(),
+    ] {
+        json_response(
+            &manager,
+            request("POST", "/api/apps", "alice", json!({"name":bad})),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let mut req = request(
+        "POST",
+        "/api/apps",
+        "alice",
+        json!({"name":"x".repeat(16384)}),
+    );
+    assert_eq!(
+        manager.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    req = request("GET", "/api/apps", "alice", Value::Null);
+    req.headers_mut().insert(
+        "x-keygate-proxy-secret",
+        axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+    );
+    json_response(&manager, req, StatusCode::UNAUTHORIZED).await;
+    for sub in ["".to_owned(), "a".repeat(513)] {
+        json_response(
+            &manager,
+            request("GET", "/api/apps", &sub, Value::Null),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    }
+    json_response(
+        &manager,
+        request(
+            "DELETE",
+            &format!("/api/apps/{app}/keys/{}", Uuid::new_v4()),
+            "alice",
+            Value::Null,
+        ),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let mut entry = store.get(app).await.unwrap().unwrap();
+    entry.app.keys = vec![entry.app.keys[0].clone(); 1000];
+    store.put(&entry.app, entry.version).await.unwrap();
+    json_response(
+        &manager,
+        request(
+            "POST",
+            &format!("/api/apps/{app}/keys"),
+            "alice",
+            json!({"name":"excess"}),
+        ),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    // Alice's quota must not consume Bob's quota on the same shared application.
+    json_response(
+        &manager,
+        request(
+            "POST",
+            &format!("/api/apps/{app}/keys"),
+            "bob",
+            json!({"name":"own quota"}),
+        ),
+        StatusCode::CREATED,
+    )
+    .await;
+    json_response(
+        &manager,
+        request(
+            "POST",
+            &format!("/api/apps/{}/keys", Uuid::new_v4()),
+            "bob",
+            json!({"name":"missing"}),
+        ),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert!(Manager::new(store.clone(), "short".into(), "http://localhost".into()).is_err());
+    for origin in [
+        "not a URL",
+        "https://example.com/path",
+        "https://example.com/",
+        "ftp://example.com",
+    ] {
+        assert!(Manager::new(store.clone(), SECRET.into(), origin.into()).is_err());
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_duplicate_credentials_never_authorize() {
+    let (store, manager) = setup().await;
+    let (app, _, token) = create(&manager).await;
+    let auth = authz_router(Authorizer::new(store, Duration::ZERO, 16));
+    for value in [
+        None,
+        Some("Basic abc"),
+        Some("Bearer "),
+        Some("Bearer invalid"),
+    ] {
+        let mut request = Request::builder().uri(format!("/check/{app}"));
+        if let Some(v) = value {
+            request = request.header("authorization", v);
+        }
+        assert_eq!(
+            auth.clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let request = Request::builder()
+        .uri(format!("/check/{app}"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("authorization", "Bearer other")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        auth.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let missing = Uuid::new_v4();
+    let (_, token) = keygate::model::issue("alice".into(), "unknown".into());
+    assert_eq!(
+        check(&auth, missing, &token).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn manager_storage_errors_are_sanitized_and_do_not_issue_keys() {
+    struct Broken {
+        inner: Arc<dyn Store>,
+        conflict: bool,
+    }
+    #[async_trait::async_trait]
+    impl Store for Broken {
+        async fn get(&self, id: Uuid) -> Result<Option<Versioned>, StoreError> {
+            self.inner.get(id).await
+        }
+        async fn list(&self) -> Result<Vec<Versioned>, StoreError> {
+            Err(StoreError::Unavailable)
+        }
+        async fn put(&self, _: &Application, _: u64) -> Result<(), StoreError> {
+            Err(if self.conflict {
+                StoreError::Conflict
+            } else {
+                StoreError::Unavailable
+            })
+        }
+    }
+    let (store, manager) = setup().await;
+    let (app, key, _) = create(&manager).await;
+    for conflict in [false, true] {
+        let manager = manager_router(
+            Manager::new(
+                Arc::new(Broken {
+                    inner: store.clone(),
+                    conflict,
+                }),
+                SECRET.into(),
+                "http://localhost:8080".into(),
+            )
+            .unwrap(),
+        );
+        let code = if conflict {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        for (method, path, body) in [
+            ("POST", "/api/apps".into(), json!({"name":"new"})),
+            (
+                "POST",
+                format!("/api/apps/{app}/keys"),
+                json!({"name":"new"}),
+            ),
+            ("DELETE", format!("/api/apps/{app}/keys/{key}"), Value::Null),
+        ] {
+            let result = json_response(&manager, request(method, &path, "alice", body), code).await;
+            assert!(result.get("key").is_none());
+        }
+        json_response(
+            &manager,
+            request("GET", "/api/apps", "alice", Value::Null),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn authenticated_user_identity_comes_from_storage_not_client_headers() {
+    let (store, manager) = setup().await;
+    shared_users(store, manager).await;
+}
+async fn shared_users(store: Arc<dyn Store>, manager: Router) {
+    let auth = authz_router(Authorizer::new(store, Duration::ZERO, 16));
+    let app = json_response(
+        &manager,
+        request("POST", "/api/apps", "alice", json!({"name":"shared"})),
+        StatusCode::CREATED,
+    )
+    .await;
+    let id = app["id"].as_str().unwrap();
+    let mut keys = Vec::new();
+    for owner in ["alice", "bob"] {
+        let issued = json_response(
+            &manager,
+            request(
+                "POST",
+                &format!("/api/apps/{id}/keys"),
+                owner,
+                json!({"name":"script","owner":"attacker"}),
+            ),
+            StatusCode::CREATED,
+        )
+        .await;
+        keys.push((owner, issued.clone()));
+        let response = auth
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/check/{id}"))
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", issued["key"].as_str().unwrap()),
+                    )
+                    .header("x-auth-request-user", "attacker")
+                    .header("x-keygate-user-id", "attacker")
+                    .header("x-keygate-subject", "attacker")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-keygate-user-id"],
+            keygate::model::user_id(owner)
+        );
+        assert_eq!(
+            response.headers()["x-auth-request-user"],
+            response.headers()["x-keygate-user-id"]
+        );
+        assert_eq!(response.headers()["x-keygate-app"], id);
+        assert_eq!(
+            response.headers()["x-keygate-key-id"],
+            issued["id"].as_str().unwrap()
+        );
+        let me = json_response(
+            &manager,
+            request("GET", "/api/me", owner, Value::Null),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(me["user_id"], keygate::model::user_id(owner));
+    }
+    for (owner, issued) in &keys {
+        let other = if *owner == "alice" { "bob" } else { "alice" };
+        let list = json_response(
+            &manager,
+            request("GET", "/api/apps", owner, Value::Null),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(list[0]["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["keys"][0]["id"], issued["id"]);
+        let path = format!("/api/apps/{id}/keys/{}", issued["id"].as_str().unwrap());
+        json_response(
+            &manager,
+            request("DELETE", &path, other, Value::Null),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(
+            check(
+                &auth,
+                Uuid::parse_str(id).unwrap(),
+                issued["key"].as_str().unwrap()
+            )
+            .await,
+            StatusCode::OK
+        );
+        json_response(
+            &manager,
+            request("DELETE", &path, owner, Value::Null),
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+        assert_eq!(
+            check(
+                &auth,
+                Uuid::parse_str(id).unwrap(),
+                issued["key"].as_str().unwrap()
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_ownership_lookup_and_invalid_key_name_cannot_mutate_storage() {
+    let (store, manager) = setup().await;
+    let (app, key, _) = create(&manager).await;
+    json_response(
+        &manager,
+        request(
+            "POST",
+            &format!("/api/apps/{app}/keys"),
+            "alice",
+            json!({"name":"\n"}),
+        ),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(store.get(app).await.unwrap().unwrap().app.keys.len(), 1);
+    let manager = manager_router(
+        Manager::new(
+            Arc::new(Failing {
+                inner: store,
+                fail: AtomicBool::new(true),
+            }),
+            SECRET.into(),
+            "http://localhost:8080".into(),
+        )
+        .unwrap(),
+    );
+    json_response(
+        &manager,
+        request(
+            "POST",
+            &format!("/api/apps/{app}/keys"),
+            "alice",
+            json!({"name":"new"}),
+        ),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    json_response(
+        &manager,
+        request(
+            "DELETE",
+            &format!("/api/apps/{app}/keys/{key}"),
+            "alice",
+            Value::Null,
+        ),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn postgres_shared_user_management_and_authorization() {
+    let db = common::Database::start();
+    let pg = keygate::store::PostgresStore::open(&db.url).await.unwrap();
+    pg.initialize().await.unwrap();
+    let store: Arc<dyn Store> = Arc::new(pg);
+    let manager = manager_router(
+        Manager::new(store.clone(), SECRET.into(), "http://localhost:8080".into()).unwrap(),
+    );
+    shared_users(store, manager).await;
+}
+
+#[tokio::test]
+async fn opaque_key_cannot_cross_application_scope() {
+    let (store, manager) = setup().await;
+    let (first, _, first_token) = create(&manager).await;
+    let (second, _, second_token) = create(&manager).await;
+    let auth = authz_router(Authorizer::new(store, Duration::ZERO, 16));
+    assert_eq!(check(&auth, first, &first_token).await, StatusCode::OK);
+    assert_eq!(check(&auth, second, &second_token).await, StatusCode::OK);
+    assert_eq!(
+        check(&auth, first, &second_token).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        check(&auth, second, &first_token).await,
+        StatusCode::UNAUTHORIZED
+    );
 }
