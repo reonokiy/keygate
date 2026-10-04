@@ -2,12 +2,13 @@ pub mod config;
 mod http;
 pub mod identity;
 pub mod model;
+pub mod scim;
 pub mod store;
 
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Request, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{any, delete, get, post},
@@ -64,7 +65,7 @@ impl Manager {
     }
 }
 #[derive(Clone)]
-struct Identity(String);
+struct Identity(String, Vec<String>);
 #[derive(Debug)]
 struct Error(StatusCode, &'static str);
 impl IntoResponse for Error {
@@ -107,10 +108,10 @@ async fn manager_auth(State(s): State<Manager>, mut req: Request, next: Next) ->
     if !trusted {
         return Error(StatusCode::UNAUTHORIZED, "trusted login required").into_response();
     }
-    let subject = if let Some(oidc) = &s.oidc {
+    let (subject, groups) = if let Some(oidc) = &s.oidc {
         match header(h, "x-keygate-id-token") {
-            Some(token) => match oidc.subject(token).await {
-                Ok(sub) => sub,
+            Some(token) => match oidc.verify(token).await {
+                Ok(principal) => (principal.subject, principal.groups),
                 Err(identity::IdentityError::Invalid) => {
                     return Error(StatusCode::UNAUTHORIZED, "invalid login token").into_response();
                 }
@@ -126,7 +127,12 @@ async fn manager_auth(State(s): State<Manager>, mut req: Request, next: Next) ->
         }
     } else {
         match header(h, "x-keygate-subject").filter(|v| !v.is_empty() && v.len() <= 512) {
-            Some(sub) => sub.to_owned(),
+            Some(sub) => (
+                sub.to_owned(),
+                header(h, "x-keygate-groups")
+                    .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+                    .unwrap_or_default(),
+            ),
             None => {
                 return Error(StatusCode::UNAUTHORIZED, "trusted login required").into_response();
             }
@@ -137,7 +143,7 @@ async fn manager_auth(State(s): State<Manager>, mut req: Request, next: Next) ->
     {
         return Error(StatusCode::FORBIDDEN, "invalid request origin").into_response();
     }
-    let identity = Identity(subject);
+    let identity = Identity(subject, groups);
     req.extensions_mut().insert(identity);
     next.run(req).await
 }
@@ -208,6 +214,7 @@ async fn list_apps(
         s.config
             .applications()
             .iter()
+            .filter(|configured| id.1.contains(&configured.group))
             .map(|configured| {
                 let keys = apps
                     .iter()
@@ -246,6 +253,13 @@ async fn create_key(
     Path(app): Path<Uuid>,
     Json(body): Json<Named>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
+    let configured = s
+        .config
+        .application(app)
+        .ok_or(Error(StatusCode::NOT_FOUND, "application not found"))?;
+    if !id.1.contains(&configured.group) || !s.store.allowed(&id.0, &configured.group).await? {
+        return Err(Error(StatusCode::FORBIDDEN, "application group required"));
+    }
     let mut entry = application(&s, app).await?;
     if entry.app.keys.iter().filter(|k| k.owner == id.0).count() >= 1000 {
         return Err(Error(StatusCode::CONFLICT, "user key limit reached"));
@@ -362,29 +376,67 @@ async fn check_nested(
     State(s): State<Authorizer>,
     Path((app, _)): Path<(Uuid, String)>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Result<Response, Error> {
-    authorize(s, app, headers).await
+    authorize(s, app, headers, uri).await
 }
 async fn check(
     State(s): State<Authorizer>,
     Path(app): Path<Uuid>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Result<Response, Error> {
-    authorize(s, app, headers).await
+    authorize(s, app, headers, uri).await
 }
-async fn authorize(s: Authorizer, expected: Uuid, headers: HeaderMap) -> Result<Response, Error> {
-    let token = header(&headers, "authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(Error(StatusCode::UNAUTHORIZED, "API key required"))?;
-    if !model::valid_token(token) {
+fn api_key(headers: &HeaderMap, uri: &Uri) -> Result<String, Error> {
+    let invalid = || Error(StatusCode::UNAUTHORIZED, "invalid API key");
+    let bearer = if headers.contains_key("authorization") {
+        Some(
+            header(headers, "authorization")
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .ok_or_else(invalid)?,
+        )
+    } else {
+        None
+    };
+    let mut url = reqwest::Url::parse("http://localhost/").expect("fixed local URL");
+    url.set_query(uri.query());
+    let mut query = url
+        .query_pairs()
+        .filter(|(name, _)| name == "api_key" || name == "apikey");
+    let query_key = query.next().map(|(_, value)| value.into_owned());
+    if query.next().is_some()
+        || bearer
+            .zip(query_key.as_deref())
+            .is_some_and(|(a, b)| a != b)
+    {
+        return Err(invalid());
+    }
+    bearer
+        .map(str::to_owned)
+        .or(query_key)
+        .ok_or(Error(StatusCode::UNAUTHORIZED, "API key required"))
+}
+async fn authorize(
+    s: Authorizer,
+    expected: Uuid,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, Error> {
+    let token = api_key(&headers, &uri)?;
+    if !model::valid_token(&token) {
         return Err(Error(StatusCode::UNAUTHORIZED, "invalid API key"));
     }
     let app = s
         .app(expected)
         .await?
         .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
-    let authenticated = model::authenticate(&app, token)
+    let authenticated = model::authenticate(&app, &token)
         .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
+    let group = &s.config.application(expected).unwrap().group;
+    if !s.store.allowed(&authenticated.owner, group).await? {
+        return Err(Error(StatusCode::FORBIDDEN, "application group required"));
+    }
     Ok((
         StatusCode::OK,
         [

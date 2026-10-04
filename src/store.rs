@@ -18,6 +18,23 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     async fn get(&self, id: Uuid) -> Result<Option<Versioned>, StoreError>;
     async fn list(&self) -> Result<Vec<Versioned>, StoreError>;
+    async fn allowed(&self, _owner: &str, _group: &str) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+    async fn directory_list(&self, _kind: &str) -> Result<Vec<serde_json::Value>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+    async fn directory_put(
+        &self,
+        _kind: &str,
+        _id: &str,
+        _document: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable)
+    }
+    async fn directory_delete(&self, _kind: &str, _id: &str) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable)
+    }
     /// expected == 0 means create only. Updates must match the current version.
     async fn put(&self, app: &Application, expected: u64) -> Result<(), StoreError>;
 }
@@ -37,6 +54,8 @@ impl PostgresStore {
     /// Run with the manager's write role before starting replicas. Authz needs SELECT only.
     pub async fn initialize(&self) -> anyhow::Result<()> {
         sqlx::query("CREATE TABLE IF NOT EXISTS keygate_applications (id TEXT PRIMARY KEY, version BIGINT NOT NULL CHECK (version > 0), document JSONB NOT NULL)")
+            .execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS keygate_directory (kind TEXT NOT NULL CHECK (kind IN ('Users','Groups')), id TEXT NOT NULL, document JSONB NOT NULL, PRIMARY KEY (kind,id))")
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -60,6 +79,41 @@ fn decode(row: sqlx::postgres::PgRow) -> Result<Versioned, StoreError> {
 }
 #[async_trait]
 impl Store for PostgresStore {
+    async fn allowed(&self, owner: &str, group: &str) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM keygate_directory u JOIN keygate_directory g ON g.kind = 'Groups', jsonb_array_elements(g.document->'members') m WHERE u.kind = 'Users' AND u.document->>'externalId' = $1 AND COALESCE((u.document->>'active')::boolean, true) AND g.document->>'displayName' = $2 AND m->>'value' = u.id)")
+            .bind(owner).bind(group).fetch_one(&self.pool).await.map_err(|_| StoreError::Unavailable)
+    }
+    async fn directory_list(&self, kind: &str) -> Result<Vec<serde_json::Value>, StoreError> {
+        let rows = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+            "SELECT document FROM keygate_directory WHERE kind=$1 ORDER BY id",
+        )
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+        Ok(rows.into_iter().map(|document| document.0).collect())
+    }
+
+    async fn directory_put(
+        &self,
+        kind: &str,
+        id: &str,
+        document: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO keygate_directory (kind,id,document) VALUES ($1,$2,$3::jsonb) ON CONFLICT (kind,id) DO UPDATE SET document=EXCLUDED.document")
+            .bind(kind).bind(id).bind(document.to_string()).execute(&self.pool).await.map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
+    async fn directory_delete(&self, kind: &str, id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM keygate_directory WHERE kind=$1 AND id=$2")
+            .bind(kind)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
+
     async fn get(&self, id: Uuid) -> Result<Option<Versioned>, StoreError> {
         sqlx::query(
             "SELECT version, document::text AS document FROM keygate_applications WHERE id = $1",

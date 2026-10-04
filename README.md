@@ -127,3 +127,39 @@ cargo coverage
 ```
 
 CI 要求全部生产 Rust 源码（含 main.rs）行和函数覆盖率 100%；HTML 报告位于 `target/llvm-cov/html/index.html`。检查格式和 lint：`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`。安全边界和测试范围见 [SECURITY.md](SECURITY.md)。
+
+## Per-application Pocket ID authorization
+
+Every configured application must declare an OIDC `group` alongside its UUID and name.
+The manager verifies `groups` from the signed ID token, lists only matching applications,
+and requires both that claim and current provisioned membership before issuing a key.
+Request the `groups` OIDC scope. For the explicitly trusted subject-header mode, the
+trusted proxy must also overwrite `X-Keygate-Groups` with a JSON string array.
+
+Enable Pocket ID SCIM provisioning at `https://keys.nokiy.net/scim/v2` and provide a
+separate bearer credential through `KEYGATE_SCIM_TOKEN_FILE`. Provisioning routes use
+that token alone and must be routed separately from the human OIDC middleware.
+The receiver supports the Users/Groups list, create, read, replace and delete operations
+used by Pocket ID 2.16.0, including external IDs and last-modified metadata. Since
+Pocket ID uses the group friendly name as SCIM `displayName` and its name in OIDC,
+set both group names to the catalog's `group` value.
+
+The `keygate_directory` table is owned by the manager. Give authorizers SELECT only.
+Every successful key check queries current user/group membership; it is independent
+of the application/key cache. Removing a member, deleting a group or disabling a user
+blocks existing keys as soon as SCIM applies that change. Missing membership and
+storage errors fail closed. Existing keys are preserved and can still be revoked by
+their owner after access is removed. Pocket ID normally schedules sync five minutes
+after the last change, synchronizes at least hourly, and supports manual Sync now.
+
+## URL API keys
+
+Clients can send `Authorization: Bearer <key>` or append `?api_key=<key>` to the request
+URL (`apikey` is an alias). Both use the same application, owner, membership and
+revocation checks. Duplicate query credentials or a header/query mismatch are rejected;
+a malformed Authorization header cannot fall back to a query key. Encode keys as query
+values. Provisioning tokens are never accepted as application API keys.
+
+Proxy access logs must omit query strings, Authorization and Cookie values. Registry
+responses and Keygate responses use `Cache-Control: no-store` and `Referrer-Policy:
+no-referrer`. Keep subscription URLs private.

@@ -27,6 +27,7 @@ fn request(method: &str, path: &str, owner: &str, body: Value) -> Request<Body> 
         .uri(path)
         .header("x-keygate-proxy-secret", SECRET)
         .header("x-keygate-subject", owner)
+        .header("x-keygate-groups", r#"["test-group"]"#)
         .header("origin", "http://localhost:8080")
         .header("x-keygate-csrf", "1")
         .header("content-type", "application/json")
@@ -314,6 +315,9 @@ async fn manager_rejects_mismatched_storage_records_before_mutating_keys() {
     struct Corrupt(Versioned);
     #[async_trait::async_trait]
     impl Store for Corrupt {
+        async fn allowed(&self, _: &str, _: &str) -> Result<bool, StoreError> {
+            Ok(true)
+        }
         async fn get(&self, _: Uuid) -> Result<Option<Versioned>, StoreError> {
             Ok(Some(self.0.clone()))
         }
@@ -607,6 +611,9 @@ struct Failing {
 }
 #[async_trait::async_trait]
 impl Store for Failing {
+    async fn allowed(&self, _: &str, _: &str) -> Result<bool, StoreError> {
+        Ok(true)
+    }
     async fn get(&self, id: Uuid) -> Result<Option<Versioned>, StoreError> {
         if self.fail.load(Ordering::SeqCst) {
             Err(StoreError::Unavailable)
@@ -766,6 +773,18 @@ async fn real_envoy_authorization_and_streaming() {
     assert_eq!(
         client.get(&url).send().await.unwrap().status(),
         StatusCode::UNAUTHORIZED
+    );
+    let query_response = client
+        .post(&url)
+        .query(&[("api_key", &token)])
+        .json(&json!({"stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(query_response.status(), StatusCode::OK);
+    assert_eq!(
+        query_response.headers()["x-observed-user"],
+        keygate::model::user_id("alice")
     );
     let response = client
         .post(&url)
@@ -1026,6 +1045,9 @@ async fn manager_storage_errors_are_sanitized_and_do_not_issue_keys() {
     }
     #[async_trait::async_trait]
     impl Store for Broken {
+        async fn allowed(&self, _: &str, _: &str) -> Result<bool, StoreError> {
+            Ok(true)
+        }
         async fn get(&self, id: Uuid) -> Result<Option<Versioned>, StoreError> {
             self.inner.get(id).await
         }
@@ -1244,6 +1266,7 @@ async fn postgres_shared_user_management_and_authorization() {
     let db = common::Database::start();
     let pg = keygate::store::PostgresStore::open(&db.url).await.unwrap();
     pg.initialize().await.unwrap();
+    common::seed_directory(&pg, "test-group", &["alice", "bob"]).await;
     let store: Arc<dyn Store> = Arc::new(pg);
     let manager = manager_router(
         Manager::new(

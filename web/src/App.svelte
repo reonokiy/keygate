@@ -101,14 +101,14 @@
   </header>
   <section class="intro">
     <h2>Manage my API keys</h2>
-    <p>Your administrator configures applications and API access rules. Generate API keys for configured applications and view or manage only your own keys.</p>
+    <p>Your administrator configures applications and API access rules. Generate API keys for applications authorized for your account and view or manage only your own keys.</p>
   </section>
   <p id="status" role="status" aria-live="polite">{status}</p>
   <section id="apps" aria-label="Applications" aria-busy={loading}>
     {#if loading}
       <p class="empty">Loading applications…</p>
     {:else if applications.length === 0 && !status}
-      <p class="empty">Your administrator has not configured any applications yet. Contact your administrator to add an application before generating an API key.</p>
+      <p class="empty">No applications are authorized for your account. Ask your administrator to assign the application group before generating an API key.</p>
     {/if}
     {#each applications as app (app.id)}
       <ApplicationCard {app} issuanceBlocked={issuing || newKey.length > 0} onissue={issue} onrevoke={revoke} />

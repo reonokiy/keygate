@@ -20,10 +20,17 @@ pub struct Oidc {
 }
 #[derive(Deserialize)]
 struct Claims {
+    #[serde(default)]
+    groups: Vec<String>,
     sub: String,
     aud: serde_json::Value,
     azp: Option<String>,
 }
+pub struct Principal {
+    pub subject: String,
+    pub groups: Vec<String>,
+}
+
 impl Oidc {
     pub fn new(issuer: String, audience: String, jwks_url: String) -> anyhow::Result<Self> {
         for s in [&issuer, &jwks_url] {
@@ -56,6 +63,9 @@ impl Oidc {
         })
     }
     pub async fn subject(&self, token: &str) -> Result<String, IdentityError> {
+        Ok(self.verify(token).await?.subject)
+    }
+    pub async fn verify(&self, token: &str) -> Result<Principal, IdentityError> {
         if token.len() > 16384 {
             return Err(IdentityError::Invalid);
         }
@@ -133,7 +143,10 @@ impl Oidc {
         {
             return Err(IdentityError::Invalid);
         }
-        Ok(claims.sub)
+        Ok(Principal {
+            subject: claims.sub,
+            groups: claims.groups,
+        })
     }
 }
 

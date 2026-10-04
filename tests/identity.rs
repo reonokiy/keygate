@@ -33,9 +33,34 @@ async fn verifies_forwarded_id_token_and_rejects_forged_subject() {
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some("test".into());
     let key = EncodingKey::from_ed_der(bytes.as_ref());
-    let claims = json!({"sub":"alice","iss":issuer,"aud":"keygate","exp":now+300});
+    let claims =
+        json!({"sub":"alice", "groups":["test-group"],"iss":issuer,"aud":"keygate","exp":now+300});
     let token = encode(&header, &claims, &key).unwrap();
     assert_eq!(verifier.subject(&token).await.unwrap(), "alice");
+    assert_eq!(
+        verifier.verify(&token).await.unwrap().groups,
+        vec!["test-group"]
+    );
+    let mut missing_groups = claims.clone();
+    missing_groups.as_object_mut().unwrap().remove("groups");
+    let missing_token = encode(&header, &missing_groups, &key).unwrap();
+    assert!(
+        verifier
+            .verify(&missing_token)
+            .await
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+    let mut malformed_groups = claims.clone();
+    malformed_groups["groups"] = json!("test-group");
+    assert!(
+        verifier
+            .verify(&encode(&header, &malformed_groups, &key).unwrap())
+            .await
+            .is_err()
+    );
+
     for (field, value) in [
         ("aud", json!("another-app")),
         ("iss", json!("https://evil.example")),
