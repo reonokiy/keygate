@@ -18,14 +18,62 @@ pub fn config() -> Arc<Config> {
 pub fn config_for(applications: &[(Uuid, &str)]) -> Arc<Config> {
     let applications: Vec<_> = applications
         .iter()
-        .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+        .map(|(id, name)| serde_json::json!({"id": id, "name": name, "group": "test-group"}))
         .collect();
     Arc::new(Config::parse(&serde_json::json!({"applications": applications}).to_string()).unwrap())
 }
 #[derive(Default)]
-pub struct Memory(Mutex<BTreeMap<Uuid, Versioned>>);
+pub struct Memory(
+    Mutex<BTreeMap<Uuid, Versioned>>,
+    Mutex<BTreeMap<(String, String), serde_json::Value>>,
+);
 #[async_trait::async_trait]
 impl Store for Memory {
+    async fn allowed(&self, owner: &str, group: &str) -> Result<bool, StoreError> {
+        let resources = self.1.lock().unwrap();
+        if resources.is_empty() {
+            return Ok(group == "test-group");
+        }
+        Ok(resources.iter().any(|((kind, id), user)| {
+            kind == "Users"
+                && user["externalId"] == owner
+                && user["active"] == true
+                && resources.iter().any(|((kind, _), g)| {
+                    kind == "Groups"
+                        && g["displayName"] == group
+                        && g["members"]
+                            .as_array()
+                            .is_some_and(|m| m.iter().any(|v| v["value"] == *id))
+                })
+        }))
+    }
+    async fn directory_list(&self, kind: &str) -> Result<Vec<serde_json::Value>, StoreError> {
+        Ok(self
+            .1
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((k, _), _)| k == kind)
+            .map(|(_, v)| v.clone())
+            .collect())
+    }
+    async fn directory_put(
+        &self,
+        kind: &str,
+        id: &str,
+        document: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.1
+            .lock()
+            .unwrap()
+            .insert((kind.into(), id.into()), document.clone());
+        Ok(())
+    }
+    async fn directory_delete(&self, kind: &str, id: &str) -> Result<(), StoreError> {
+        self.1.lock().unwrap().remove(&(kind.into(), id.into()));
+        Ok(())
+    }
+
     async fn get(&self, id: Uuid) -> Result<Option<Versioned>, StoreError> {
         Ok(self.0.lock().unwrap().get(&id).cloned())
     }
@@ -115,4 +163,22 @@ impl Drop for Database {
             .args(["rm", "-f", &self.name])
             .output();
     }
+}
+
+pub async fn seed_directory(store: &dyn Store, group: &str, owners: &[&str]) {
+    let mut members = Vec::new();
+    for (index, owner) in owners.iter().enumerate() {
+        let id = Uuid::from_u128(100 + index as u128).to_string();
+        store
+            .directory_put(
+                "Users",
+                &id,
+                &serde_json::json!({"id":id,"externalId":owner,"active":true}),
+            )
+            .await
+            .unwrap();
+        members.push(serde_json::json!({"value":id}));
+    }
+    let id = Uuid::from_u128(99).to_string();
+    store.directory_put("Groups", &id, &serde_json::json!({"id":id,"externalId":"test-group-id","displayName":group,"members":members})).await.unwrap();
 }

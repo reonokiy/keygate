@@ -18,6 +18,7 @@ async fn postgres_cas_persistence_concurrency_and_read_only_authorizer() {
     let store = PostgresStore::open(&db.url).await.unwrap();
     store.initialize().await.unwrap();
     store.initialize().await.unwrap();
+    common::seed_directory(&store, "test-group", &["alice"]).await;
     assert!(store.list().await.unwrap().is_empty());
     let mut app = app();
     assert!(store.get(app.id).await.unwrap().is_none());
@@ -54,7 +55,7 @@ async fn postgres_cas_persistence_concurrency_and_read_only_authorizer() {
         .unwrap();
     assert!(!document.contains(&token));
     assert!(document.contains(&keygate::model::digest(&token)));
-    sqlx::raw_sql("CREATE ROLE authz LOGIN PASSWORD 'read-only-test'; GRANT CONNECT ON DATABASE postgres TO authz; GRANT USAGE ON SCHEMA public TO authz; GRANT SELECT ON keygate_applications TO authz;").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE ROLE authz LOGIN PASSWORD 'read-only-test'; GRANT CONNECT ON DATABASE postgres TO authz; GRANT USAGE ON SCHEMA public TO authz; GRANT SELECT ON keygate_applications, keygate_directory TO authz;").execute(&pool).await.unwrap();
     let readonly = PostgresStore::open(
         &db.url
             .replace("postgres:isolated-test-only@", "authz:read-only-test@"),

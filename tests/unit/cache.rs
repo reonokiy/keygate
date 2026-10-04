@@ -7,7 +7,7 @@ use std::{
 fn configured(id: Uuid) -> Arc<crate::config::Config> {
     Arc::new(
         crate::config::Config::parse(
-            &serde_json::json!({"applications": [{"id": id, "name": "app"}]}).to_string(),
+            &serde_json::json!({"applications": [{"id": id, "name": "app", "group": "test-group"}]}).to_string(),
         )
         .unwrap(),
     )
@@ -21,6 +21,9 @@ struct Probe {
 }
 #[async_trait::async_trait]
 impl Store for Probe {
+    async fn allowed(&self, _: &str, _: &str) -> Result<bool, StoreError> {
+        Ok(true)
+    }
     async fn get(&self, _: Uuid) -> Result<Option<Versioned>, StoreError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         if self.hang {

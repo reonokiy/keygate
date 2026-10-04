@@ -87,14 +87,14 @@ fn invalid_application_config_fails_before_database_connection() {
             r#"{{"applications":[{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"API","{sentinel}":true}}]}}"#
         ),
         format!(
-            r#"{{"applications":[{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"API"}},{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"{sentinel}"}}]}}"#
+            r#"{{"applications":[{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"API", "group": "test-group"}},{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"{sentinel}", "group": "test-group"}}]}}"#
         ),
-        format!(r#"{{"applications":[{{"id":"{sentinel}","name":"API"}}]}}"#),
-        r#"{"applications":[{"id":"00000000-0000-0000-0000-000000000000","name":"API"}]}"#
+        format!(r#"{{"applications":[{{"id":"{sentinel}","name":"API", "group": "test-group"}}]}}"#),
+        r#"{"applications":[{"id":"00000000-0000-0000-0000-000000000000","name":"API", "group": "test-group"}]}"#
             .to_owned(),
-        r#"{"applications":[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":" "}]}"#.to_owned(),
+        r#"{"applications":[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":" ", "group": "test-group"}]}"#.to_owned(),
         format!(
-            r#"{{"applications":[{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"{sentinel}\nAPI"}}]}}"#
+            r#"{{"applications":[{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"{sentinel}\nAPI", "group": "test-group"}}]}}"#
         ),
     ];
     for (case, contents) in cases.iter().enumerate() {
@@ -123,7 +123,7 @@ fn valid_application_config_loads_from_cli_and_environment() {
     let config = temp.path().join("keygate.json");
     for contents in [
         r#"{"applications":[]}"#,
-        r#"{"applications":[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"API"}]}"#,
+        r#"{"applications":[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"API", "group": "test-group"}]}"#,
     ] {
         std::fs::write(&config, contents).unwrap();
         for mode in ["manager", "authz", "all"] {
@@ -167,7 +167,7 @@ async fn cli_modes_and_graceful_shutdown() {
     let app_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     std::fs::write(
         &config,
-        serde_json::json!({"applications":[{"id":app_id,"name":"Administrator configured API"}]})
+        serde_json::json!({"applications":[{"id":app_id,"name":"Administrator configured API", "group": "test-group"}]})
             .to_string(),
     )
     .unwrap();
@@ -193,6 +193,7 @@ async fn cli_modes_and_graceful_shutdown() {
         ]);
         if trusted {
             cmd.arg("--trust-subject-header");
+            cmd.args(["--scim-token-file", secret.to_str().unwrap()]);
         } else {
             cmd.args([
                 "--oidc-issuer",
@@ -246,6 +247,7 @@ async fn cli_modes_and_graceful_shutdown() {
                     "test-proxy-secret-at-least-32-bytes-long",
                 )
                 .header("x-keygate-subject", "alice")
+                .header("x-keygate-groups", r#"["test-group", "codex-users"]"#)
                 .send()
                 .await
                 .unwrap();
@@ -261,9 +263,10 @@ async fn cli_modes_and_graceful_shutdown() {
                     "test-proxy-secret-at-least-32-bytes-long",
                 )
                 .header("x-keygate-subject", "alice")
+                .header("x-keygate-groups", r#"["test-group", "codex-users"]"#)
                 .header("origin", "http://localhost:8080")
                 .header("x-keygate-csrf", "1")
-                .json(&serde_json::json!({"name":"User-created API"}))
+                .json(&serde_json::json!({"name":"User-created API", "group": "test-group"}))
                 .send()
                 .await
                 .unwrap();

@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub struct ConfiguredApplication {
     pub id: Uuid,
     pub name: String,
+    pub group: String,
 }
 
 pub struct Config {
@@ -29,6 +30,13 @@ impl Config {
             anyhow::ensure!(
                 !app.id.is_nil() && ids.insert(app.id),
                 "application configuration requires unique, non-nil UUIDs"
+            );
+            app.group = app.group.trim().to_owned();
+            anyhow::ensure!(
+                !app.group.is_empty()
+                    && app.group.len() <= 128
+                    && !app.group.chars().any(char::is_control),
+                "each application requires a explicit, nonempty OIDC group"
             );
             app.name = app.name.trim().to_owned();
             anyhow::ensure!(

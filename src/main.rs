@@ -31,6 +31,8 @@ struct Args {
     /// Only for proxies that securely overwrite the subject header after validating identity.
     #[arg(long, env = "KEYGATE_TRUST_SUBJECT_HEADER", default_value = "false")]
     trust_subject_header: bool,
+    #[arg(long, env = "KEYGATE_SCIM_TOKEN_FILE")]
+    scim_token_file: Option<PathBuf>,
     #[arg(long, env = "KEYGATE_PROXY_SECRET_FILE")]
     proxy_secret_file: Option<PathBuf>,
     #[arg(
@@ -127,7 +129,7 @@ async fn manager(
     )
     .await?;
     let mut manager = Manager::new(
-        store,
+        store.clone(),
         config,
         secret.trim().into(),
         args.public_origin.clone(),
@@ -145,5 +147,14 @@ async fn manager(
                 .ok_or_else(|| anyhow::anyhow!("--oidc-jwks-url is required"))?,
         )?);
     }
-    Ok(manager_router(manager))
+    let router = manager_router(manager);
+    if let Some(path) = &args.scim_token_file {
+        let token = tokio::fs::read_to_string(path).await?;
+        Ok(router.nest(
+            "/scim/v2",
+            keygate::scim::router(keygate::scim::Scim::new(store, token.trim().into())?),
+        ))
+    } else {
+        Ok(router)
+    }
 }

@@ -8,8 +8,8 @@ fn catalog_preserves_admin_order_and_normalizes_names() {
     let second = Uuid::new_v4();
     let config = Config::parse(
         &json!({"applications": [
-            {"id": first, "name": "  First API  "},
-            {"id": second, "name": "第二个 API"}
+            {"id": first, "name": "  First API  ", "group": "first"},
+            {"id": second, "name": "第二个 API", "group": "second"}
         ]})
         .to_string(),
     )
@@ -51,12 +51,37 @@ fn catalog_rejects_ambiguous_or_misspelled_configuration() {
         "é".repeat(65),
     ] {
         assert!(
-            Config::parse(&json!({"applications": [{"id": id, "name": name}]}).to_string())
-                .is_err()
+            Config::parse(
+                &json!({"applications": [{"id": id, "name": name, "group": "test-group"}]})
+                    .to_string()
+            )
+            .is_err()
         );
     }
     assert!(
-        Config::parse(&json!({"applications": [{"id": id, "name": "é".repeat(64)}]}).to_string())
-            .is_ok()
+        Config::parse(
+            &json!({"applications": [{"id": id, "name": "é".repeat(64), "group": "test-group"}]})
+                .to_string()
+        )
+        .is_ok()
     );
+}
+
+#[test]
+fn catalog_requires_an_explicit_application_group() {
+    let id = Uuid::new_v4();
+    for group in [
+        "".to_string(),
+        " ".to_string(),
+        "a\nb".to_string(),
+        "a".repeat(129),
+    ] {
+        assert!(
+            Config::parse(
+                &json!({"applications":[{"id":id,"name":"A","group":group}]}).to_string()
+            )
+            .is_err()
+        );
+    }
+    assert!(Config::parse(&json!({"applications":[{"id":id,"name":"A"}]}).to_string()).is_err());
 }
