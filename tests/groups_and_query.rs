@@ -362,6 +362,42 @@ async fn scim_requires_its_own_token_and_controls_user_and_group_lifecycle() {
 }
 #[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
+async fn uuid_membership_survives_display_name_change() {
+    let db = common::Database::start();
+    let store = PostgresStore::open(&db.url).await.unwrap();
+    store.initialize().await.unwrap();
+    directory(&store).await;
+
+    let row_id = Uuid::from_u128(11).to_string();
+    let group_id = Uuid::from_u128(12);
+    let other_group = Uuid::from_u128(13);
+    for display_name in ["test-group", "Test Group Users"] {
+        store
+            .directory_put(
+                "Groups",
+                &row_id,
+                &json!({
+                    "id": row_id, "externalId": group_id, "displayName": display_name,
+                    "members": [{"value": Uuid::from_u128(10)}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(store.allowed_by_group_id("alice", group_id).await.unwrap());
+        assert!(
+            !store
+                .allowed_by_group_id("alice", other_group)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(!store.allowed("alice", "test-group").await.unwrap());
+    store.directory_delete("Groups", &row_id).await.unwrap();
+    assert!(!store.allowed_by_group_id("alice", group_id).await.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
 async fn postgres_directory_survives_restart_and_revokes_existing_key_access() {
     let db = common::Database::start();
     let store = PostgresStore::open(&db.url).await.unwrap();

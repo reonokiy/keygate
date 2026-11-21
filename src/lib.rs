@@ -257,7 +257,9 @@ async fn create_key(
         .config
         .application(app)
         .ok_or(Error(StatusCode::NOT_FOUND, "application not found"))?;
-    if !id.1.contains(&configured.group) || !s.store.allowed(&id.0, &configured.group).await? {
+    if !id.1.contains(&configured.group)
+        || !configured.allows_member(s.store.as_ref(), &id.0).await?
+    {
         return Err(Error(StatusCode::FORBIDDEN, "application group required"));
     }
     let mut entry = application(&s, app).await?;
@@ -433,8 +435,11 @@ async fn authorize(
         .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
     let authenticated = model::authenticate(&app, &token)
         .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid API key"))?;
-    let group = &s.config.application(expected).unwrap().group;
-    if !s.store.allowed(&authenticated.owner, group).await? {
+    let configured = s.config.application(expected).unwrap();
+    if !configured
+        .allows_member(s.store.as_ref(), &authenticated.owner)
+        .await?
+    {
         return Err(Error(StatusCode::FORBIDDEN, "application group required"));
     }
     Ok((

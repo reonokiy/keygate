@@ -18,6 +18,9 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     async fn get(&self, id: Uuid) -> Result<Option<Versioned>, StoreError>;
     async fn list(&self) -> Result<Vec<Versioned>, StoreError>;
+    async fn allowed_by_group_id(&self, _owner: &str, _group_id: Uuid) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     async fn allowed(&self, _owner: &str, _group: &str) -> Result<bool, StoreError> {
         Err(StoreError::Unavailable)
     }
@@ -77,11 +80,25 @@ fn decode(row: sqlx::postgres::PgRow) -> Result<Versioned, StoreError> {
         .map_err(|_| StoreError::Unavailable)?,
     })
 }
+impl PostgresStore {
+    async fn directory_allows(
+        &self,
+        owner: &str,
+        group: &str,
+        group_field: &str,
+    ) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM keygate_directory u JOIN keygate_directory g ON g.kind = 'Groups', jsonb_array_elements(g.document->'members') m WHERE u.kind = 'Users' AND u.document->>'externalId' = $1 AND COALESCE((u.document->>'active')::boolean, true) AND g.document->>$3 = $2 AND m->>'value' = u.id)")
+            .bind(owner).bind(group).bind(group_field).fetch_one(&self.pool).await.map_err(|_| StoreError::Unavailable)
+    }
+}
 #[async_trait]
 impl Store for PostgresStore {
     async fn allowed(&self, owner: &str, group: &str) -> Result<bool, StoreError> {
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM keygate_directory u JOIN keygate_directory g ON g.kind = 'Groups', jsonb_array_elements(g.document->'members') m WHERE u.kind = 'Users' AND u.document->>'externalId' = $1 AND COALESCE((u.document->>'active')::boolean, true) AND g.document->>'displayName' = $2 AND m->>'value' = u.id)")
-            .bind(owner).bind(group).fetch_one(&self.pool).await.map_err(|_| StoreError::Unavailable)
+        self.directory_allows(owner, group, "displayName").await
+    }
+    async fn allowed_by_group_id(&self, owner: &str, group_id: Uuid) -> Result<bool, StoreError> {
+        self.directory_allows(owner, &group_id.to_string(), "externalId")
+            .await
     }
     async fn directory_list(&self, kind: &str) -> Result<Vec<serde_json::Value>, StoreError> {
         let rows = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(

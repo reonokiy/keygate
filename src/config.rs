@@ -9,6 +9,20 @@ pub struct ConfiguredApplication {
     pub id: Uuid,
     pub name: String,
     pub group: String,
+    pub scim_group_id: Option<Uuid>,
+}
+
+impl ConfiguredApplication {
+    pub async fn allows_member(
+        &self,
+        store: &dyn crate::store::Store,
+        owner: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        match self.scim_group_id {
+            Some(id) => store.allowed_by_group_id(owner, id).await,
+            None => store.allowed(owner, &self.group).await,
+        }
+    }
 }
 
 pub struct Config {
@@ -30,6 +44,10 @@ impl Config {
             anyhow::ensure!(
                 !app.id.is_nil() && ids.insert(app.id),
                 "application configuration requires unique, non-nil UUIDs"
+            );
+            anyhow::ensure!(
+                !app.scim_group_id.is_some_and(|id| id.is_nil()),
+                "SCIM group UUID cannot be nil"
             );
             app.group = app.group.trim().to_owned();
             anyhow::ensure!(
