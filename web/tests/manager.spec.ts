@@ -20,7 +20,10 @@ async function serveManager(page: Page, base: string, options: {
   secondApp?: boolean;
   delayIssue?: boolean;
 } = {}) {
-  const keys: Key[] = [];
+  const keysByApp = new Map<string, Key[]>([
+    [appId, []],
+    [secondAppId, []],
+  ]);
   const errors: string[] = [];
   const requests: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -45,28 +48,33 @@ async function serveManager(page: Page, base: string, options: {
     } else if (path === `${base}api/me`) {
       await route.fulfill({ json: { subject: 'alice', user_id: 'usr_alice' } });
     } else if (path === `${base}api/apps` && request.method() === 'GET') {
-      if (options.failRefresh && keys.length > 0) {
+      const totalKeys = [...keysByApp.values()].reduce((sum, list) => sum + list.length, 0);
+      if (options.failRefresh && totalKeys > 0) {
         await route.fulfill({ status: 503, json: { error: 'application list unavailable' } });
       } else {
-        const applications = [{ id: appId, name: 'Configured API', keys }];
-        if (options.secondApp) applications.push({ id: secondAppId, name: 'Second API', keys: [] });
+        const applications = [{ id: appId, name: 'Configured API', keys: keysByApp.get(appId) ?? [] }];
+        if (options.secondApp) {
+          applications.push({ id: secondAppId, name: 'Second API', keys: keysByApp.get(secondAppId) ?? [] });
+        }
         await route.fulfill({ json: options.empty ? [] : applications });
       }
     } else if ([appId, secondAppId].some((id) => path === `${base}api/apps/${id}/keys`) && request.method() === 'POST') {
       expect(request.headers()['x-keygate-csrf']).toBe('1');
       expect(request.headers()['content-type']).toBe('application/json');
+      const targetAppId = [appId, secondAppId].find((id) => path === `${base}api/apps/${id}/keys`)!;
       if (options.failIssue) {
         await route.fulfill({ status: 409, json: { error: 'concurrent update; reload and retry' } });
       } else {
         if (options.delayIssue) await new Promise((resolve) => setTimeout(resolve, 250));
         const body = request.postDataJSON() as { name: string };
+        const keys = keysByApp.get(targetAppId)!;
         const id = `key-${keys.length + 1}`;
         keys.push({ id, name: body.name, created_at: 1_700_000_000, revoked: false });
         await route.fulfill({ status: 201, json: { id, key: token } });
       }
     } else if (path.startsWith(`${base}api/apps/${appId}/keys/`) && request.method() === 'DELETE') {
       expect(request.headers()['x-keygate-csrf']).toBe('1');
-      const key = keys.find((entry) => path.endsWith(`/${entry.id}`));
+      const key = keysByApp.get(appId)!.find((entry) => path.endsWith(`/${entry.id}`));
       expect(key).toBeDefined();
       key!.revoked = true;
       await route.fulfill({ status: 204 });
@@ -81,36 +89,59 @@ async function serveManager(page: Page, base: string, options: {
 for (const base of ['/', '/keys/']) {
   test(`key lifecycle works under ${base} with production CSP`, async ({ page }, testInfo) => {
     if (base === '/keys/') await page.setViewportSize({ width: 390, height: 844 });
-    const { errors, requests } = await serveManager(page, base);
+    const { errors, requests } = await serveManager(page, base, { secondApp: true });
     await expect(page.locator('html')).toHaveAttribute('lang', 'en');
     await expect(page.getByRole('heading', { name: 'Configured API' })).toBeVisible();
     await expect(page.locator('#identity')).toHaveText('alice');
     await expect(page.locator('#create-app')).toHaveCount(0);
-    await page.getByLabel('Key name').fill('<script>alert("key name")</script>');
+
     await page.getByRole('button', { name: 'Generate key' }).click();
     await expect(page.getByRole('dialog')).toBeVisible();
+    await page.getByLabel('Key name').fill('<script>alert("key name")</script>');
+    await page.getByRole('button', { name: 'Create key' }).click();
     await expect(page.getByLabel('New API key')).toHaveValue(token);
+
     // The fixture's HTTP origin has no clipboard API; exercise the selection fallback.
     await page.getByRole('button', { name: 'Copy key' }).click();
     await expect.poll(() => page.getByLabel('New API key').evaluate((element) => {
       const field = element as HTMLTextAreaElement;
       return field.selectionEnd - field.selectionStart;
     })).toBe(token.length);
+
     await page.getByRole('button', { name: 'Saved, close' }).click();
     await expect(page.getByRole('dialog')).not.toBeVisible();
-    await expect(page.getByLabel('New API key')).toHaveValue('');
-    await expect(page.locator('li strong')).toHaveText('<script>alert("key name")</script>');
-    await expect(page.locator('li script')).toHaveCount(0);
-    page.once('dialog', (dialog) => dialog.accept());
+    await expect(page.getByLabel('New API key')).toHaveCount(0);
+    await expect(page.locator('tbody strong')).toHaveText('<script>alert("key name")</script>');
+    await expect(page.locator('tbody script')).toHaveCount(0);
+
     await page.getByRole('button', { name: 'Revoke', exact: true }).click();
-    await expect(page.locator('li')).toContainText('Revoked');
+    await expect(page.getByRole('alertdialog')).toBeVisible();
+    await page.getByRole('button', { name: 'Revoke key' }).click();
+    await expect(page.getByRole('alertdialog')).not.toBeVisible();
+    await expect(page.locator('tbody tr')).toContainText('Revoked');
     await expect(page.getByRole('button', { name: 'Revoke', exact: true })).toHaveCount(0);
-    await page.getByLabel('Key name').fill('second key');
+
     await page.getByRole('button', { name: 'Generate key' }).click();
+    await page.getByLabel('Key name').fill('second key');
+    await page.getByRole('button', { name: 'Create key' }).click();
     await expect(page.getByLabel('New API key')).toHaveValue(token);
     await page.keyboard.press('Escape');
     await expect(page.getByRole('dialog')).not.toBeVisible();
-    await expect(page.getByLabel('New API key')).toHaveValue('');
+    await expect(page.getByLabel('New API key')).toHaveCount(0);
+
+    // Status tabs and search filter work.
+    await page.getByRole('tab', { name: /Active/ }).click();
+    await expect(page.locator('tbody tr')).toHaveCount(1);
+    await expect(page.locator('tbody tr')).toContainText('second key');
+    await page.getByRole('tab', { name: /Revoked/ }).click();
+    await expect(page.locator('tbody tr')).toHaveCount(1);
+    await expect(page.locator('tbody tr')).toContainText('<script>alert("key name")</script>');
+    await page.getByRole('tab', { name: /All/ }).click();
+    await page.getByLabel('Search keys').fill('second');
+    await expect(page.locator('tbody tr')).toHaveCount(1);
+    await page.getByRole('button', { name: 'Reset' }).click();
+    await expect(page.locator('tbody tr')).toHaveCount(2);
+
     await expect(page.locator('body')).not.toContainText(/[\u3400-\u9fff]/);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath('manager.png'), fullPage: true });
@@ -122,39 +153,58 @@ for (const base of ['/', '/keys/']) {
 test('empty catalog offers no application creation', async ({ page }) => {
   await serveManager(page, '/', { empty: true });
   await expect(page.locator('#apps')).toContainText('administrator');
-  await expect(page.locator('form')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Generate key' })).toHaveCount(0);
 });
 
 test('issuance failure is shown and allows retry', async ({ page }) => {
   await serveManager(page, '/', { failIssue: true });
-  await page.getByLabel('Key name').fill('script');
   await page.getByRole('button', { name: 'Generate key' }).click();
+  await page.getByLabel('Key name').fill('script');
+  await page.getByRole('button', { name: 'Create key' }).click();
   await expect(page.getByRole('status')).toContainText('concurrent update; reload and retry');
-  await expect(page.getByRole('button', { name: 'Generate key' })).toBeEnabled();
-  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create key' })).toBeEnabled();
+  await expect(page.getByLabel('New API key')).toHaveCount(0);
 });
 
-test('successful issuance stays visible and clears the form if refreshing fails', async ({ page }) => {
+test('successful issuance stays visible and clears draft if refreshing fails', async ({ page }) => {
   await serveManager(page, '/', { failRefresh: true });
-  await page.getByLabel('Key name').fill('script');
   await page.getByRole('button', { name: 'Generate key' }).click();
+  await page.getByLabel('Key name').fill('script');
+  await page.getByRole('button', { name: 'Create key' }).click();
   await expect(page.getByLabel('New API key')).toHaveValue(token);
   await expect(page.getByRole('status')).toContainText('application list unavailable');
+  await page.getByRole('button', { name: 'Saved, close' }).click();
+  await page.getByRole('button', { name: 'Generate key' }).click();
   await expect(page.getByLabel('Key name')).toHaveValue('');
 });
 
-test('issuing for another application cannot overwrite an unsaved key', async ({ page }) => {
+test('in-flight issuance blocks duplicate submission and prevents overwriting an unsaved key', async ({ page }) => {
   const { requests } = await serveManager(page, '/', { secondApp: true, delayIssue: true });
-  await page.getByLabel('Key name').nth(0).fill('first');
-  await page.getByLabel('Key name').nth(1).fill('second');
-  await page.getByRole('button', { name: 'Generate key' }).nth(0).click();
-  await expect(page.getByRole('button', { name: 'Generate key' }).nth(1)).toBeDisabled();
-  await page.locator('form').nth(1).evaluate((form) => {
+  await page.getByRole('button', { name: 'Generate key' }).click();
+  await page.getByLabel('Key name').fill('first');
+  await page.getByRole('button', { name: 'Create key' }).click();
+  await expect(page.getByRole('button', { name: 'Generating…' })).toBeDisabled();
+  await page.locator('#generate-key-form').evaluate((form) => {
     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
   });
   await expect(page.getByLabel('New API key')).toHaveValue(token);
   expect(requests.filter((request) => request.startsWith('POST '))).toHaveLength(1);
-  await expect(page.getByRole('button', { name: 'Generate key' }).nth(1)).toBeDisabled();
   await page.getByRole('button', { name: 'Saved, close' }).click();
-  await expect(page.getByRole('button', { name: 'Generate key' }).nth(1)).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Generate key' })).toBeEnabled();
+});
+
+test('switching applications works via desktop sidebar and mobile sheet', async ({ page }) => {
+  const desktop = await serveManager(page, '/', { secondApp: true });
+  await page.locator('aside').getByRole('button', { name: /Second API/ }).click();
+  await expect(page.getByRole('heading', { name: 'Second API' })).toBeVisible();
+  expect(desktop.errors).toEqual([]);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const mobile = await serveManager(page, '/', { secondApp: true });
+  await expect(page.getByRole('heading', { name: 'Configured API' })).toBeVisible();
+  await page.getByRole('button', { name: 'Open applications menu' }).click();
+  await page.locator('#mobile-nav-sheet').getByRole('button', { name: /Second API/ }).click();
+  await expect(page.getByRole('heading', { name: 'Second API' })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect(mobile.errors).toEqual([]);
 });
