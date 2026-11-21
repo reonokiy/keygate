@@ -1,9 +1,10 @@
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
   base: './',
-  plugins: [svelte({ configFile: false })],
+  plugins: [tailwindcss(), svelte({ configFile: false })],
   build: {
     cssCodeSplit: false,
     modulePreload: false,
