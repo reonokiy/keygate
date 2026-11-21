@@ -361,6 +361,29 @@ async fn scim_requires_its_own_token_and_controls_user_and_group_lifecycle() {
     );
 }
 #[tokio::test]
+async fn uuid_membership_does_not_fall_back_to_display_name() {
+    let store = common::Memory::default();
+    directory(&store).await;
+    let config = Config::parse(
+        &json!({"applications": [{
+            "id": common::APP_ID, "name": "Test", "group": "test-group",
+            "scim_group_id": Uuid::from_u128(12)
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    assert!(store.allowed("alice", "test-group").await.unwrap());
+    assert!(
+        !config
+            .application(common::APP_ID)
+            .unwrap()
+            .allows_member(&store, "alice")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
 async fn uuid_membership_survives_display_name_change() {
     let db = common::Database::start();

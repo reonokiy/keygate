@@ -32,6 +32,7 @@ fn catalog_preserves_admin_order_and_normalizes_names() {
 fn catalog_rejects_ambiguous_or_misspelled_configuration() {
     let id = Uuid::new_v4();
     for invalid in [
+        json!({"applications": [{"id": id, "name": "A", "group": "test-group", "scim_group_id": Uuid::nil()}]}).to_string(),
         String::new(),
         "{}".into(),
         r#"{"applications":[],"applications":[]}"#.into(),
