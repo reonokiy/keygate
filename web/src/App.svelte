@@ -23,6 +23,10 @@
   let selectedAppId = $state('');
   let subject = $state('');
   let userId = $state('');
+  let displayName = $state('');
+  let username = $state('');
+  let picture = $state('');
+  let avatarFailed = $state(false);
   let status = $state('');
   let loading = $state(true);
 
@@ -48,7 +52,15 @@
     applications.find((app) => app.id === selectedAppId) ?? applications[0] ?? null,
   );
 
-  let avatarInitial = $derived((subject.trim().charAt(0) || '?').toUpperCase());
+  let identityLabel = $derived(displayName || username || subject);
+  let avatarInitial = $derived((identityLabel.trim().charAt(0) || '?').toUpperCase());
+  let identityTitle = $derived.by(() => {
+    const parts: string[] = [];
+    if (username && username !== identityLabel) parts.push(`@${username}`);
+    if (subject && subject !== identityLabel) parts.push(subject);
+    if (userId) parts.push(userId);
+    return parts.length > 0 ? `Signed in (${parts.join(' · ')})` : undefined;
+  });
 
   function report(error: unknown): void {
     status = error instanceof Error ? error.message : 'Request failed. Please try again.';
@@ -84,6 +96,10 @@
       const identity = await getIdentity();
       subject = identity.subject;
       userId = identity.user_id;
+      displayName = identity.name ?? '';
+      username = identity.username ?? '';
+      picture = identity.picture ?? '';
+      avatarFailed = false;
       await refresh();
     } catch (error) {
       report(error);
@@ -345,15 +361,25 @@
 
         <div
           class="flex max-w-44 items-center gap-2 pl-1 text-xs sm:max-w-64"
-          title={userId ? `Signed in (${userId})` : undefined}
+          title={identityTitle}
         >
-          <span
-            class="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium text-foreground"
-            aria-hidden="true"
-          >
-            {avatarInitial}
-          </span>
-          <span id="identity" class="truncate font-medium text-foreground">{subject}</span>
+          {#if picture && !avatarFailed}
+            <img
+              src={picture}
+              alt={identityLabel}
+              referrerpolicy="no-referrer"
+              class="size-6 shrink-0 rounded-full object-cover ring-1 ring-border"
+              onerror={() => (avatarFailed = true)}
+            />
+          {:else}
+            <span
+              class="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium text-foreground"
+              aria-hidden="true"
+            >
+              {avatarInitial}
+            </span>
+          {/if}
+          <span id="identity" class="truncate font-medium text-foreground">{identityLabel}</span>
         </div>
       </div>
     </header>

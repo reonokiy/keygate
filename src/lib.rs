@@ -16,7 +16,7 @@ use axum::{
 use config::{Config, ConfiguredApplication};
 use model::{Application, Key, Versioned};
 use moka::future::Cache;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     sync::Arc,
@@ -65,7 +65,35 @@ impl Manager {
     }
 }
 #[derive(Clone)]
-struct Identity(String, Vec<String>);
+struct Identity {
+    subject: String,
+    groups: Vec<String>,
+    name: Option<String>,
+    username: Option<String>,
+    picture: Option<String>,
+}
+#[derive(Serialize)]
+struct Me {
+    subject: String,
+    user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    picture: Option<String>,
+}
+pub(crate) const BASE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+fn manager_csp(oidc: Option<&identity::Oidc>) -> HeaderValue {
+    let img_src = match oidc {
+        Some(oidc) => format!("'self' {}", oidc.issuer_origin()),
+        None => "'self'".into(),
+    };
+    HeaderValue::from_str(&format!(
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src {img_src}; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    ))
+    .expect("validated issuer origin produces valid CSP header")
+}
 #[derive(Debug)]
 struct Error(StatusCode, &'static str);
 impl IntoResponse for Error {
@@ -89,7 +117,11 @@ fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     }
     h.get(name)?.to_str().ok()
 }
-async fn secure_response(req: Request, next: Next) -> Response {
+pub(crate) async fn secure_response(
+    State(csp): State<HeaderValue>,
+    req: Request,
+    next: Next,
+) -> Response {
     let mut response = next.run(req).await;
     let h = response.headers_mut();
     h.insert("cache-control", HeaderValue::from_static("no-store"));
@@ -98,7 +130,7 @@ async fn secure_response(req: Request, next: Next) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    h.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
+    h.insert("content-security-policy", csp);
     response
 }
 async fn manager_auth(State(s): State<Manager>, mut req: Request, next: Next) -> Response {
@@ -108,10 +140,16 @@ async fn manager_auth(State(s): State<Manager>, mut req: Request, next: Next) ->
     if !trusted {
         return Error(StatusCode::UNAUTHORIZED, "trusted login required").into_response();
     }
-    let (subject, groups) = if let Some(oidc) = &s.oidc {
+    let identity = if let Some(oidc) = &s.oidc {
         match header(h, "x-keygate-id-token") {
             Some(token) => match oidc.verify(token).await {
-                Ok(principal) => (principal.subject, principal.groups),
+                Ok(principal) => Identity {
+                    subject: principal.subject,
+                    groups: principal.groups,
+                    name: principal.name,
+                    username: principal.username,
+                    picture: principal.picture,
+                },
                 Err(identity::IdentityError::Invalid) => {
                     return Error(StatusCode::UNAUTHORIZED, "invalid login token").into_response();
                 }
@@ -127,12 +165,15 @@ async fn manager_auth(State(s): State<Manager>, mut req: Request, next: Next) ->
         }
     } else {
         match header(h, "x-keygate-subject").filter(|v| !v.is_empty() && v.len() <= 512) {
-            Some(sub) => (
-                sub.to_owned(),
-                header(h, "x-keygate-groups")
+            Some(sub) => Identity {
+                subject: sub.to_owned(),
+                groups: header(h, "x-keygate-groups")
                     .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
                     .unwrap_or_default(),
-            ),
+                name: None,
+                username: None,
+                picture: None,
+            },
             None => {
                 return Error(StatusCode::UNAUTHORIZED, "trusted login required").into_response();
             }
@@ -143,11 +184,11 @@ async fn manager_auth(State(s): State<Manager>, mut req: Request, next: Next) ->
     {
         return Error(StatusCode::FORBIDDEN, "invalid request origin").into_response();
     }
-    let identity = Identity(subject, groups);
     req.extensions_mut().insert(identity);
     next.run(req).await
 }
 pub fn manager_router(s: Manager) -> Router {
+    let csp = manager_csp(s.oidc.as_deref());
     Router::new()
         .route(
             "/",
@@ -175,7 +216,13 @@ pub fn manager_router(s: Manager) -> Router {
             "/api/me",
             get(
                 |axum::Extension(id): axum::Extension<Identity>| async move {
-                    Json(json!({"subject":id.0,"user_id":model::user_id(&id.0)}))
+                    Json(Me {
+                        user_id: model::user_id(&id.subject),
+                        subject: id.subject,
+                        name: id.name,
+                        username: id.username,
+                        picture: id.picture,
+                    })
                 },
             ),
         )
@@ -185,7 +232,7 @@ pub fn manager_router(s: Manager) -> Router {
         .layer(middleware::from_fn_with_state(s.clone(), manager_auth))
         .route("/healthz", get(|| async { "ok" }))
         .layer(DefaultBodyLimit::max(16384))
-        .layer(middleware::from_fn(secure_response))
+        .layer(middleware::from_fn_with_state(csp, secure_response))
         .with_state(s)
 }
 fn public_app(app: &ConfiguredApplication, keys: &[Key], owner: &str) -> Value {
@@ -214,13 +261,13 @@ async fn list_apps(
         s.config
             .applications()
             .iter()
-            .filter(|configured| id.1.contains(&configured.group))
+            .filter(|configured| id.groups.contains(&configured.group))
             .map(|configured| {
                 let keys = apps
                     .iter()
                     .find(|a| a.app.id == configured.id)
                     .map_or(&[][..], |a| a.app.keys.as_slice());
-                public_app(configured, keys, &id.0)
+                public_app(configured, keys, &id.subject)
             })
             .collect::<Vec<_>>()
     )))
@@ -257,16 +304,25 @@ async fn create_key(
         .config
         .application(app)
         .ok_or(Error(StatusCode::NOT_FOUND, "application not found"))?;
-    if !id.1.contains(&configured.group)
-        || !configured.allows_member(s.store.as_ref(), &id.0).await?
+    if !id.groups.contains(&configured.group)
+        || !configured
+            .allows_member(s.store.as_ref(), &id.subject)
+            .await?
     {
         return Err(Error(StatusCode::FORBIDDEN, "application group required"));
     }
     let mut entry = application(&s, app).await?;
-    if entry.app.keys.iter().filter(|k| k.owner == id.0).count() >= 1000 {
+    if entry
+        .app
+        .keys
+        .iter()
+        .filter(|k| k.owner == id.subject)
+        .count()
+        >= 1000
+    {
         return Err(Error(StatusCode::CONFLICT, "user key limit reached"));
     }
-    let (key, token) = model::issue(id.0, name(body.name)?);
+    let (key, token) = model::issue(id.subject, name(body.name)?);
     let key_id = key.id;
     entry.app.keys.push(key);
     s.store.put(&entry.app, entry.version).await?;
@@ -282,7 +338,7 @@ async fn revoke_key(
         .app
         .keys
         .iter_mut()
-        .find(|k| k.id == key && k.owner == id.0)
+        .find(|k| k.id == key && k.owner == id.subject)
         .ok_or(Error(StatusCode::NOT_FOUND, "key not found"))?;
     if !key.revoked {
         key.revoked = true;
@@ -371,7 +427,10 @@ pub fn authz_router(s: Authorizer) -> Router {
         .route("/check/{app}/", any(check))
         .route("/check/{app}/{*rest}", any(check_nested))
         .layer(DefaultBodyLimit::max(0))
-        .layer(middleware::from_fn(secure_response))
+        .layer(middleware::from_fn_with_state(
+            HeaderValue::from_static(BASE_CSP),
+            secure_response,
+        ))
         .with_state(s)
 }
 async fn check_nested(

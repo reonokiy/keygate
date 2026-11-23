@@ -4,7 +4,11 @@ import { readFile } from 'node:fs/promises';
 const appId = '11111111-1111-4111-8111-111111111111';
 const secondAppId = '22222222-2222-4222-8222-222222222222';
 const token = `kg-${'Ab'.repeat(23)}`;
-const policy = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+const policy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+const tinyPng = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2S8AAAAASUVORK5CYII=',
+  'base64',
+);
 
 interface Key {
   id: string;
@@ -13,12 +17,22 @@ interface Key {
   revoked: boolean;
 }
 
+interface MockIdentity {
+  subject: string;
+  user_id: string;
+  name?: string;
+  username?: string;
+  picture?: string;
+}
+
 async function serveManager(page: Page, base: string, options: {
   empty?: boolean;
   failIssue?: boolean;
   failRefresh?: boolean;
   secondApp?: boolean;
   delayIssue?: boolean;
+  identity?: MockIdentity;
+  avatarStatus?: number;
 } = {}) {
   const keysByApp = new Map<string, Key[]>([
     [appId, []],
@@ -45,8 +59,16 @@ async function serveManager(page: Page, base: string, options: {
     }
     if (path.endsWith('/favicon.ico')) {
       await route.fulfill({ status: 204 });
+    } else if (path === '/avatar.png') {
+      if (options.avatarStatus && options.avatarStatus !== 200) {
+        await route.fulfill({ status: options.avatarStatus });
+      } else {
+        await route.fulfill({ body: tinyPng, contentType: 'image/png' });
+      }
     } else if (path === `${base}api/me`) {
-      await route.fulfill({ json: { subject: 'alice', user_id: 'usr_alice' } });
+      await route.fulfill({
+        json: options.identity ?? { subject: 'alice', user_id: 'usr_alice' },
+      });
     } else if (path === `${base}api/apps` && request.method() === 'GET') {
       const totalKeys = [...keysByApp.values()].reduce((sum, list) => sum + list.length, 0);
       if (options.failRefresh && totalKeys > 0) {
@@ -207,4 +229,38 @@ test('switching applications works via desktop sidebar and mobile sheet', async 
   await expect(page.getByRole('heading', { name: 'Second API' })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   expect(mobile.errors).toEqual([]);
+});
+
+test('renders OIDC display name and avatar with fallback on image error', async ({ page }) => {
+  const uuid = '01950000-0000-7000-8000-000000000001';
+  const { errors } = await serveManager(page, '/', {
+    identity: {
+      subject: uuid,
+      user_id: 'usr_alice',
+      name: 'Alice Example',
+      username: 'alice',
+      picture: 'http://keygate.test/avatar.png',
+    },
+  });
+  await expect(page.locator('#identity')).toHaveText('Alice Example');
+  await expect(page.locator('#identity')).not.toContainText(uuid);
+  const avatar = page.locator('header img[alt="Alice Example"]');
+  await expect(avatar).toBeVisible();
+  await expect.poll(() => avatar.evaluate((img) => {
+    const el = img as HTMLImageElement;
+    return el.complete && el.naturalWidth > 0;
+  })).toBe(true);
+  expect(errors).toEqual([]);
+
+  await serveManager(page, '/', {
+    identity: {
+      subject: uuid,
+      user_id: 'usr_alice',
+      username: 'alice',
+      picture: 'http://keygate.test/avatar.png',
+    },
+    avatarStatus: 404,
+  });
+  await expect(page.locator('#identity')).toHaveText('alice');
+  await expect(page.locator('header img')).toHaveCount(0);
 });

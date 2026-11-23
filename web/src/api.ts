@@ -1,6 +1,9 @@
 export interface Identity {
   subject: string;
   user_id: string;
+  name?: string;
+  username?: string;
+  picture?: string;
 }
 
 export interface ApiKey {

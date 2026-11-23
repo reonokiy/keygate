@@ -3,7 +3,7 @@ use crate::{Error, header, model, store::Store};
 use axum::{
     Json, Router,
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -44,7 +44,10 @@ pub fn router(s: Scim) -> Router {
         .route("/{kind}/{id}", get(read).put(replace).delete(remove))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(s.clone(), auth))
-        .layer(middleware::from_fn(crate::secure_response))
+        .layer(middleware::from_fn_with_state(
+            HeaderValue::from_static(crate::BASE_CSP),
+            crate::secure_response,
+        ))
         .with_state(s)
 }
 fn kind(kind: &str) -> Result<(), Error> {
