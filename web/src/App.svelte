@@ -4,6 +4,7 @@
   import CircleAlert from '@lucide/svelte/icons/circle-alert';
   import Copy from '@lucide/svelte/icons/copy';
   import KeyRound from '@lucide/svelte/icons/key-round';
+  import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import Lock from '@lucide/svelte/icons/lock';
   import Moon from '@lucide/svelte/icons/moon';
   import PanelLeft from '@lucide/svelte/icons/panel-left';
@@ -33,9 +34,12 @@
   let dialogApp = $state<Application | null>(null);
   let draftKeyName = $state('');
   let newKey = $state('');
+  let issuedKeyId = $state<string | null>(null);
   let issuedKeyName = $state('');
+  let recentKeyId = $state<string | null>(null);
   let issuing = $state(false);
   let copied = $state(false);
+  let recentKeyTimer: ReturnType<typeof setTimeout> | undefined;
 
   let pendingRevoke = $state<{ appId: string; key: ApiKey } | null>(null);
   let revokingKeyId = $state<string | null>(null);
@@ -120,6 +124,12 @@
       darkTheme = window.matchMedia('(prefers-color-scheme: dark)').matches;
     }
     void initialize();
+    return () => {
+      if (recentKeyTimer !== undefined) {
+        clearTimeout(recentKeyTimer);
+        recentKeyTimer = undefined;
+      }
+    };
   });
 
   function selectApp(appId: string): void {
@@ -162,6 +172,7 @@
     try {
       const result = await issueKey(target.id, draftKeyName);
       newKey = result.key;
+      issuedKeyId = result.id;
       issuedKeyName = trimmed;
       draftKeyName = '';
       copied = false;
@@ -174,12 +185,24 @@
     }
   }
 
+  function highlightRecentKey(id: string | null): void {
+    if (!id) return;
+    recentKeyId = id;
+    if (recentKeyTimer !== undefined) clearTimeout(recentKeyTimer);
+    recentKeyTimer = setTimeout(() => {
+      recentKeyId = null;
+    }, 1800);
+  }
+
   function clearKeyDialog(): void {
+    const createdId = issuedKeyId;
     newKey = '';
+    issuedKeyId = null;
     issuedKeyName = '';
     draftKeyName = '';
     dialogApp = null;
     copied = false;
+    highlightRecentKey(createdId);
   }
 
   function closeKeyDialog(): void {
@@ -311,16 +334,16 @@
   </div>
 {/snippet}
 
-<div class="flex min-h-screen bg-background text-foreground">
+<div class="flex min-h-screen bg-background text-foreground transition-colors duration-200">
   <aside
-    class="hidden w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar md:flex"
+    class="hidden w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar transition-colors duration-200 md:flex"
     aria-label="Sidebar"
   >
     {@render sidebarContent(false)}
   </aside>
 
   <div class="flex min-w-0 flex-1 flex-col">
-    <header class="sticky top-0 z-10 flex h-14 shrink-0 items-center justify-between gap-3 border-b border-border bg-background/95 px-4 backdrop-blur-xs sm:px-6">
+    <header class="sticky top-0 z-10 flex h-14 shrink-0 items-center justify-between gap-3 border-b border-border bg-background/95 px-4 backdrop-blur-xs transition-colors duration-200 sm:px-6">
       <div class="flex min-w-0 items-center gap-2">
         <Button
           variant="ghost"
@@ -352,11 +375,15 @@
           aria-label="Toggle color theme"
           title={darkTheme ? 'Switch to light theme' : 'Switch to dark theme'}
         >
-          {#if darkTheme}
-            <Sun class="size-4" />
-          {:else}
-            <Moon class="size-4" />
-          {/if}
+          {#key darkTheme}
+            <span class="kg-icon-swap inline-flex items-center justify-center">
+              {#if darkTheme}
+                <Sun class="size-4" />
+              {:else}
+                <Moon class="size-4" />
+              {/if}
+            </span>
+          {/key}
         </Button>
 
         <div
@@ -368,7 +395,7 @@
               src={picture}
               alt={identityLabel}
               referrerpolicy="no-referrer"
-              class="size-6 shrink-0 rounded-full object-cover ring-1 ring-border"
+              class="kg-fade-in size-6 shrink-0 rounded-full object-cover ring-1 ring-border"
               onerror={() => (avatarFailed = true)}
             />
           {:else}
@@ -387,7 +414,7 @@
     <main class="mx-auto w-full max-w-4xl flex-1 px-4 py-6 sm:px-6 sm:py-8">
       <div id="status" role="status" aria-live="polite" class={status ? 'mb-6' : 'sr-only'}>
         {#if status}
-          <Alert variant="destructive">
+          <Alert variant="destructive" class="kg-alert-in">
             <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
             <div class="min-w-0 flex-1">
               <p class="font-medium">Request failed</p>
@@ -420,7 +447,7 @@
             <p class="text-xs text-muted-foreground">Loading applications…</p>
           </div>
         {:else if applications.length === 0 && !status}
-          <div class="flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-16 text-center">
+          <div class="kg-panel-in flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-16 text-center">
             <div
               class="mb-3 flex size-10 items-center justify-center rounded-lg border border-border bg-muted/50 text-muted-foreground"
               aria-hidden="true"
@@ -433,13 +460,18 @@
             </p>
           </div>
         {:else if selectedApp}
-          <ApplicationCard
-            app={selectedApp}
-            issuanceBlocked={issuing || newKey.length > 0}
-            {revokingKeyId}
-            onopenissue={openIssueDialog}
-            onrequestrevoke={requestRevoke}
-          />
+          {#key selectedApp.id}
+            <div class="kg-panel-in">
+              <ApplicationCard
+                app={selectedApp}
+                issuanceBlocked={issuing || newKey.length > 0}
+                {revokingKeyId}
+                {recentKeyId}
+                onopenissue={openIssueDialog}
+                onrequestrevoke={requestRevoke}
+              />
+            </div>
+          {/key}
         {/if}
       </section>
     </main>
@@ -465,118 +497,127 @@
   oncancel={handleKeyDialogCancel}
   onclose={clearKeyDialog}
 >
-  <div class="flex flex-col gap-4 rounded-lg border border-border bg-popover p-6 text-popover-foreground shadow-lg">
+  <div class="rounded-lg border border-border bg-popover p-6 text-popover-foreground shadow-lg">
     {#if newKey}
-      <div class="space-y-1.5">
-        <h2 id="key-dialog-title" class="text-base font-semibold tracking-tight text-foreground">
-          API key generated
-        </h2>
-        <p class="text-sm text-muted-foreground">
-          {#if dialogApp?.name || issuedKeyName}
-            Created <strong class="font-medium text-foreground">{issuedKeyName}</strong>
-            {#if dialogApp?.name} for {dialogApp.name}{/if}.
-          {:else}
-            Save this key now.
-          {/if}
-        </p>
-      </div>
-
-      <Alert variant="warning">
-        <TriangleAlert class="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
-        <div class="min-w-0 flex-1">
-          <p class="text-xs font-medium text-foreground">Shown once only</p>
-          <p class="mt-0.5 text-xs text-muted-foreground">
-            You will not be able to view this key after closing this dialog.
-          </p>
-        </div>
-      </Alert>
-
-      {#if status}
-        <Alert variant="destructive">
-          <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <p class="text-xs">{status}</p>
-        </Alert>
-      {/if}
-
-      <textarea
-        id="new-key"
-        bind:this={keyField}
-        value={newKey}
-        readonly
-        aria-label="New API key"
-        rows={3}
-        class="w-full resize-none rounded-md border border-input bg-muted px-3 py-2.5 font-mono text-xs leading-relaxed break-all text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
-      ></textarea>
-
-      <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-        <Button id="copy-key" variant="outline" onclick={copyKey}>
-          {#if copied}
-            <Check class="size-4 text-success" />
-            Copied
-          {:else}
-            <Copy class="size-4" />
-            Copy key
-          {/if}
-        </Button>
-        <Button id="close-key" variant="default" onclick={closeKeyDialog}>Saved, close</Button>
-      </div>
-    {:else}
-      <div class="flex items-start justify-between gap-4">
+      <div class="kg-step-in flex flex-col gap-4">
         <div class="space-y-1.5">
           <h2 id="key-dialog-title" class="text-base font-semibold tracking-tight text-foreground">
-            Generate API key
+            API key generated
           </h2>
           <p class="text-sm text-muted-foreground">
-            Create a new API key{#if dialogApp} for <strong class="font-medium text-foreground">{dialogApp.name}</strong>{/if}. The secret is shown only once.
+            {#if dialogApp?.name || issuedKeyName}
+              Created <strong class="font-medium text-foreground">{issuedKeyName}</strong>
+              {#if dialogApp?.name} for {dialogApp.name}{/if}.
+            {:else}
+              Save this key now.
+            {/if}
           </p>
         </div>
-        <Button
-          variant="ghost"
-          size="iconSm"
-          disabled={issuing}
-          onclick={closeKeyDialog}
-          aria-label="Close dialog"
-          class="-mt-1 -mr-1 text-muted-foreground"
-        >
-          <X class="size-4" />
-        </Button>
-      </div>
 
-      {#if status}
-        <Alert variant="destructive">
-          <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <p class="text-xs">{status}</p>
+        <Alert variant="warning">
+          <TriangleAlert class="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div class="min-w-0 flex-1">
+            <p class="text-xs font-medium text-foreground">Shown once only</p>
+            <p class="mt-0.5 text-xs text-muted-foreground">
+              You will not be able to view this key after closing this dialog.
+            </p>
+          </div>
         </Alert>
-      {/if}
 
-      <form id="generate-key-form" class="space-y-4" onsubmit={submitIssue}>
-        <div class="space-y-2">
-          <label class="block text-sm font-medium text-foreground" for="key-name-input">
-            Key name
-          </label>
-          <Input
-            id="key-name-input"
-            bind:ref={keyNameInput}
-            bind:value={draftKeyName}
-            placeholder="e.g. Local development"
-            required
-            maxlength={128}
-            autocomplete="off"
-            aria-label="Key name"
-            disabled={issuing}
-          />
-          <p class="text-xs text-muted-foreground">
-            Use a descriptive name so you can identify and revoke this key later.
-          </p>
-        </div>
+        {#if status}
+          <Alert variant="destructive" class="kg-alert-in">
+            <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            <p class="text-xs">{status}</p>
+          </Alert>
+        {/if}
+
+        <textarea
+          id="new-key"
+          bind:this={keyField}
+          value={newKey}
+          readonly
+          aria-label="New API key"
+          rows={3}
+          class="w-full resize-none rounded-md border border-input bg-muted px-3 py-2.5 font-mono text-xs leading-relaxed break-all text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+        ></textarea>
 
         <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <Button variant="outline" disabled={issuing} onclick={closeKeyDialog}>Cancel</Button>
-          <Button type="submit" disabled={issuing || !draftKeyName.trim()}>
-            {issuing ? 'Generating…' : 'Create key'}
+          <Button id="copy-key" variant="outline" onclick={copyKey}>
+            {#if copied}
+              <Check class="kg-pop-in size-4 text-success" />
+              Copied
+            {:else}
+              <Copy class="size-4" />
+              Copy key
+            {/if}
+          </Button>
+          <Button id="close-key" variant="default" onclick={closeKeyDialog}>Saved, close</Button>
+        </div>
+      </div>
+    {:else}
+      <div class="kg-step-in flex flex-col gap-4">
+        <div class="flex items-start justify-between gap-4">
+          <div class="space-y-1.5">
+            <h2 id="key-dialog-title" class="text-base font-semibold tracking-tight text-foreground">
+              Generate API key
+            </h2>
+            <p class="text-sm text-muted-foreground">
+              Create a new API key{#if dialogApp} for <strong class="font-medium text-foreground">{dialogApp.name}</strong>{/if}. The secret is shown only once.
+            </p>
+          </div>
+          <Button
+            variant="ghost"
+            size="iconSm"
+            disabled={issuing}
+            onclick={closeKeyDialog}
+            aria-label="Close dialog"
+            class="-mt-1 -mr-1 text-muted-foreground"
+          >
+            <X class="size-4" />
           </Button>
         </div>
-      </form>
+
+        {#if status}
+          <Alert variant="destructive" class="kg-alert-in">
+            <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            <p class="text-xs">{status}</p>
+          </Alert>
+        {/if}
+
+        <form id="generate-key-form" class="space-y-4" onsubmit={submitIssue}>
+          <div class="space-y-2">
+            <label class="block text-sm font-medium text-foreground" for="key-name-input">
+              Key name
+            </label>
+            <Input
+              id="key-name-input"
+              bind:ref={keyNameInput}
+              bind:value={draftKeyName}
+              placeholder="e.g. Local development"
+              required
+              maxlength={128}
+              autocomplete="off"
+              aria-label="Key name"
+              disabled={issuing}
+            />
+            <p class="text-xs text-muted-foreground">
+              Use a descriptive name so you can identify and revoke this key later.
+            </p>
+          </div>
+
+          <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button variant="outline" disabled={issuing} onclick={closeKeyDialog}>Cancel</Button>
+            <Button type="submit" disabled={issuing || !draftKeyName.trim()}>
+              {#if issuing}
+                <LoaderCircle class="size-4 animate-spin" aria-hidden="true" />
+                Generating…
+              {:else}
+                Create key
+              {/if}
+            </Button>
+          </div>
+        </form>
+      </div>
     {/if}
   </div>
 </dialog>
@@ -619,7 +660,12 @@
         disabled={revokingKeyId !== null}
         onclick={confirmRevoke}
       >
-        {revokingKeyId !== null ? 'Revoking…' : 'Revoke key'}
+        {#if revokingKeyId !== null}
+          <LoaderCircle class="size-4 animate-spin" aria-hidden="true" />
+          Revoking…
+        {:else}
+          Revoke key
+        {/if}
       </Button>
     </div>
   </div>
