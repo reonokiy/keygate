@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 
 @custom-variant dark (&:where(.dark, .dark *));
 
@@ -34,7 +35,6 @@
   --sidebar-border: oklch(0.922 0 0);
   --radius: 0.5rem;
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -249,50 +249,6 @@
   }
 }
 
-@keyframes kg-panel-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes kg-step-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px) scale(0.985);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes kg-alert-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes kg-row-in {
-  from {
-    opacity: 0;
-    transform: translateY(3px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 @keyframes kg-row-highlight {
   0% {
     background-color: color-mix(in srgb, var(--success) 13%, transparent);
@@ -302,70 +258,9 @@
   }
 }
 
-@keyframes kg-pop-in {
-  from {
-    opacity: 0;
-    transform: scale(0.65);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-
-@keyframes kg-icon-swap {
-  from {
-    opacity: 0;
-    transform: rotate(-30deg) scale(0.75);
-  }
-  to {
-    opacity: 1;
-    transform: rotate(0deg) scale(1);
-  }
-}
-
-@keyframes kg-fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
 @layer utilities {
-  .kg-panel-in {
-    animation: kg-panel-in 180ms var(--ease-out) both;
-  }
-
-  .kg-step-in {
-    animation: kg-step-in 200ms var(--ease-out) both;
-  }
-
-  .kg-alert-in {
-    animation: kg-alert-in 180ms var(--ease-out) both;
-  }
-
-  .kg-row-in {
-    animation: kg-row-in 160ms var(--ease-out) both;
-  }
-
   .kg-row-highlight {
-    animation:
-      kg-row-in 160ms var(--ease-out) both,
-      kg-row-highlight 1.6s ease-out both;
-  }
-
-  .kg-pop-in {
-    animation: kg-pop-in 180ms var(--ease-spring) both;
-  }
-
-  .kg-icon-swap {
-    animation: kg-icon-swap 200ms var(--ease-out) both;
-  }
-
-  .kg-fade-in {
-    animation: kg-fade-in 180ms ease-out both;
+    animation: kg-row-highlight 1.6s ease-out both;
   }
 }
 

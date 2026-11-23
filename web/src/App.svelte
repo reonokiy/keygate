@@ -376,7 +376,7 @@
           title={darkTheme ? 'Switch to light theme' : 'Switch to dark theme'}
         >
           {#key darkTheme}
-            <span class="kg-icon-swap inline-flex items-center justify-center">
+            <span class="animate-in fade-in-0 zoom-in-75 -spin-in-45 duration-200 ease-out inline-flex items-center justify-center">
               {#if darkTheme}
                 <Sun class="size-4" />
               {:else}
@@ -395,7 +395,7 @@
               src={picture}
               alt={identityLabel}
               referrerpolicy="no-referrer"
-              class="kg-fade-in size-6 shrink-0 rounded-full object-cover ring-1 ring-border"
+              class="animate-in fade-in-0 duration-200 size-6 shrink-0 rounded-full object-cover ring-1 ring-border"
               onerror={() => (avatarFailed = true)}
             />
           {:else}
@@ -414,7 +414,7 @@
     <main class="mx-auto w-full max-w-4xl flex-1 px-4 py-6 sm:px-6 sm:py-8">
       <div id="status" role="status" aria-live="polite" class={status ? 'mb-6' : 'sr-only'}>
         {#if status}
-          <Alert variant="destructive" class="kg-alert-in">
+          <Alert variant="destructive" class="animate-in fade-in-0 slide-in-from-top-1 duration-200 ease-out">
             <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
             <div class="min-w-0 flex-1">
               <p class="font-medium">Request failed</p>
@@ -447,7 +447,7 @@
             <p class="text-xs text-muted-foreground">Loading applications…</p>
           </div>
         {:else if applications.length === 0 && !status}
-          <div class="kg-panel-in flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-16 text-center">
+          <div class="animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-16 text-center">
             <div
               class="mb-3 flex size-10 items-center justify-center rounded-lg border border-border bg-muted/50 text-muted-foreground"
               aria-hidden="true"
@@ -461,7 +461,7 @@
           </div>
         {:else if selectedApp}
           {#key selectedApp.id}
-            <div class="kg-panel-in">
+            <div class="animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out">
               <ApplicationCard
                 app={selectedApp}
                 issuanceBlocked={issuing || newKey.length > 0}
@@ -499,7 +499,7 @@
 >
   <div class="rounded-lg border border-border bg-popover p-6 text-popover-foreground shadow-lg">
     {#if newKey}
-      <div class="kg-step-in flex flex-col gap-4">
+      <div class="animate-in fade-in-0 zoom-in-95 duration-200 ease-out flex flex-col gap-4">
         <div class="space-y-1.5">
           <h2 id="key-dialog-title" class="text-base font-semibold tracking-tight text-foreground">
             API key generated
@@ -525,7 +525,7 @@
         </Alert>
 
         {#if status}
-          <Alert variant="destructive" class="kg-alert-in">
+          <Alert variant="destructive" class="animate-in fade-in-0 slide-in-from-top-1 duration-200 ease-out">
             <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
             <p class="text-xs">{status}</p>
           </Alert>
@@ -544,7 +544,7 @@
         <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           <Button id="copy-key" variant="outline" onclick={copyKey}>
             {#if copied}
-              <Check class="kg-pop-in size-4 text-success" />
+              <Check class="animate-in fade-in-0 zoom-in-75 duration-150 size-4 text-success" />
               Copied
             {:else}
               <Copy class="size-4" />
@@ -555,7 +555,7 @@
         </div>
       </div>
     {:else}
-      <div class="kg-step-in flex flex-col gap-4">
+      <div class="animate-in fade-in-0 zoom-in-95 duration-200 ease-out flex flex-col gap-4">
         <div class="flex items-start justify-between gap-4">
           <div class="space-y-1.5">
             <h2 id="key-dialog-title" class="text-base font-semibold tracking-tight text-foreground">
@@ -578,7 +578,7 @@
         </div>
 
         {#if status}
-          <Alert variant="destructive" class="kg-alert-in">
+          <Alert variant="destructive" class="animate-in fade-in-0 slide-in-from-top-1 duration-200 ease-out">
             <CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
             <p class="text-xs">{status}</p>
           </Alert>

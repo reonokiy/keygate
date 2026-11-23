@@ -113,7 +113,7 @@
           title={copiedId ? 'Copied' : 'Copy application ID'}
         >
           {#if copiedId}
-            <Check class="kg-pop-in size-3.5 text-success" />
+            <Check class="animate-in fade-in-0 zoom-in-75 duration-150 size-3.5 text-success" />
           {:else}
             <Copy class="size-3.5" />
           {/if}
@@ -132,7 +132,7 @@
   </div>
 
   {#if app.keys.length === 0}
-    <div class="kg-panel-in flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-14 text-center">
+    <div class="animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-14 text-center">
       <div
         class="mb-3 flex size-10 items-center justify-center rounded-lg border border-border bg-muted/50 text-muted-foreground"
         aria-hidden="true"
@@ -175,7 +175,7 @@
             variant="ghost"
             size="sm"
             onclick={resetFilters}
-            class="kg-fade-in text-muted-foreground"
+            class="animate-in fade-in-0 duration-150 text-muted-foreground"
           >
             Reset
             <RotateCcw class="size-3.5" />
@@ -248,7 +248,7 @@
           </thead>
           <tbody class="divide-y divide-border">
             {#if filteredKeys.length === 0}
-              <tr class="kg-fade-in">
+              <tr class="animate-in fade-in-0 duration-150">
                 <td colspan="4" class="h-24 px-4 text-center text-sm text-muted-foreground">
                   No keys match your current filter.
                 </td>
@@ -258,7 +258,7 @@
                 <tr
                   class="transition-colors duration-150 hover:bg-muted/40 {recentKeyId === key.id
                     ? 'kg-row-highlight'
-                    : 'kg-row-in'}"
+                    : 'animate-in fade-in-0 slide-in-from-bottom-1 duration-150 ease-out'}"
                 >
                   <td class="px-4 py-3 align-middle">
                     <div class="min-w-0">
