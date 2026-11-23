@@ -14,6 +14,7 @@ pub enum IdentityError {
 pub struct Oidc {
     client: reqwest::Client,
     issuer: String,
+    issuer_origin: String,
     audience: String,
     jwks_url: String,
     cache: Mutex<Option<(Instant, Result<JwkSet, ()>)>>,
@@ -25,15 +26,33 @@ struct Claims {
     sub: String,
     aud: serde_json::Value,
     azp: Option<String>,
+    #[serde(default)]
+    preferred_username: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    picture: Option<String>,
 }
 pub struct Principal {
     pub subject: String,
     pub groups: Vec<String>,
+    pub name: Option<String>,
+    pub username: Option<String>,
+    pub picture: Option<String>,
+}
+
+fn clean_text(value: Option<String>) -> Option<String> {
+    let trimmed = value?.trim().to_owned();
+    (!trimmed.is_empty() && trimmed.len() <= 256 && !trimmed.chars().any(char::is_control))
+        .then_some(trimmed)
 }
 
 impl Oidc {
     pub fn new(issuer: String, audience: String, jwks_url: String) -> anyhow::Result<Self> {
-        for s in [&issuer, &jwks_url] {
+        let mut issuer_origin = String::new();
+        for (index, s) in [&issuer, &jwks_url].into_iter().enumerate() {
             let url = reqwest::Url::parse(s)?;
             anyhow::ensure!(
                 url.scheme() == "https"
@@ -49,6 +68,9 @@ impl Oidc {
                     && url.fragment().is_none(),
                 "OIDC endpoint cannot contain credentials"
             );
+            if index == 0 {
+                issuer_origin = url.origin().ascii_serialization();
+            }
         }
         anyhow::ensure!(!audience.is_empty(), "OIDC audience is required");
         Ok(Self {
@@ -57,10 +79,25 @@ impl Oidc {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             issuer,
+            issuer_origin,
             audience,
             jwks_url,
             cache: Mutex::new(None),
         })
+    }
+    pub fn issuer_origin(&self) -> &str {
+        &self.issuer_origin
+    }
+    fn clean_picture(&self, value: Option<String>) -> Option<String> {
+        let raw = value?.trim().to_owned();
+        let url = reqwest::Url::parse(&raw).ok()?;
+        (raw.len() <= 2048
+            && !raw.chars().any(char::is_control)
+            && url.origin().ascii_serialization() == self.issuer_origin
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none())
+        .then_some(raw)
     }
     pub async fn subject(&self, token: &str) -> Result<String, IdentityError> {
         Ok(self.verify(token).await?.subject)
@@ -146,6 +183,9 @@ impl Oidc {
         Ok(Principal {
             subject: claims.sub,
             groups: claims.groups,
+            name: clean_text(claims.display_name).or_else(|| clean_text(claims.name)),
+            username: clean_text(claims.preferred_username),
+            picture: self.clean_picture(claims.picture),
         })
     }
 }

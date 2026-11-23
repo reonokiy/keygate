@@ -123,6 +123,7 @@ async fn verifies_forwarded_id_token_and_rejects_forged_subject() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/me")
@@ -135,11 +136,104 @@ async fn verifies_forwarded_id_token_and_rejects_forged_subject() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains(&format!("img-src 'self' {issuer};"))
+    );
     use http_body_util::BodyExt;
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
         json!({"subject":"alice","user_id":keygate::model::user_id("alice")})
     );
+
+    let mut profile_claims = claims.clone();
+    profile_claims["sub"] = json!("01950000-0000-7000-8000-000000000001");
+    profile_claims["display_name"] = json!(" Alice Display ");
+    profile_claims["name"] = json!("Alice Fallback");
+    profile_claims["preferred_username"] = json!("alice");
+    profile_claims["picture"] = json!(format!("{issuer}/api/users/u1/profile-picture.png"));
+    let profile_token = encode(&header, &profile_claims, &key).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .header("x-keygate-proxy-secret", secret)
+                .header("x-keygate-id-token", profile_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        json!({
+            "subject": "01950000-0000-7000-8000-000000000001",
+            "user_id": keygate::model::user_id("01950000-0000-7000-8000-000000000001"),
+            "name": "Alice Display",
+            "username": "alice",
+            "picture": format!("{issuer}/api/users/u1/profile-picture.png"),
+        })
+    );
+
+    let mut fallback_claims = claims.clone();
+    fallback_claims["display_name"] = json!("   ");
+    fallback_claims["name"] = json!("Alice Full");
+    fallback_claims["preferred_username"] = json!("bad\nuser");
+    fallback_claims["picture"] = json!("https://evil.example/avatar.png");
+    let fallback_token = encode(&header, &fallback_claims, &key).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .header("x-keygate-proxy-secret", secret)
+                .header("x-keygate-id-token", fallback_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        json!({
+            "subject": "alice",
+            "user_id": keygate::model::user_id("alice"),
+            "name": "Alice Full",
+        })
+    );
+
+    for bad_picture in [
+        "not-a-url",
+        "javascript:alert(1)",
+        &format!("{issuer}/avatar.png#frag"),
+    ] {
+        let mut bad_claims = claims.clone();
+        bad_claims["picture"] = json!(bad_picture);
+        let bad_token = encode(&header, &bad_claims, &key).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header("x-keygate-proxy-secret", secret)
+                    .header("x-keygate-id-token", bad_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert!(value.get("picture").is_none(), "must drop {bad_picture}");
+    }
     task.abort();
 }
