@@ -31,6 +31,7 @@ async function serveManager(page: Page, base: string, options: {
   failRefresh?: boolean;
   secondApp?: boolean;
   delayIssue?: boolean;
+  delayRefresh?: boolean;
   identity?: MockIdentity;
   avatarStatus?: number;
 } = {}) {
@@ -71,6 +72,9 @@ async function serveManager(page: Page, base: string, options: {
       });
     } else if (path === `${base}api/apps` && request.method() === 'GET') {
       const totalKeys = [...keysByApp.values()].reduce((sum, list) => sum + list.length, 0);
+      if (options.delayRefresh && totalKeys > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
       if (options.failRefresh && totalKeys > 0) {
         await route.fulfill({ status: 503, json: { error: 'application list unavailable' } });
       } else {
@@ -276,5 +280,18 @@ test('theme toggle and reduced-motion animations work cleanly under production C
   await expect(page.getByLabel('New API key')).toHaveValue(token);
   await page.getByRole('button', { name: 'Saved, close' }).click();
   await expect(page.locator('tbody tr.kg-row-highlight')).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
+test('closing generated key dialog via Escape works while app list refresh is still in flight', async ({ page }) => {
+  const { errors } = await serveManager(page, '/', { delayRefresh: true });
+  await page.getByRole('button', { name: 'Generate key' }).click();
+  await page.getByLabel('Key name').fill('fast close');
+  await page.getByRole('button', { name: 'Create key' }).click();
+  await expect(page.getByLabel('New API key')).toHaveValue(token);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.getByLabel('New API key')).toHaveCount(0);
+  await expect(page.locator('tbody strong')).toHaveText('fast close');
   expect(errors).toEqual([]);
 });

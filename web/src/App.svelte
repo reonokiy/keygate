@@ -176,12 +176,16 @@
       issuedKeyName = trimmed;
       draftKeyName = '';
       copied = false;
-      await tick();
+    } catch (error) {
+      report(error);
+      return;
+    } finally {
+      issuing = false;
+    }
+    try {
       await refresh();
     } catch (error) {
       report(error);
-    } finally {
-      issuing = false;
     }
   }
 
