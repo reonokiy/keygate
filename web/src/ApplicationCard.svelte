@@ -16,11 +16,19 @@
     app: Application;
     issuanceBlocked: boolean;
     revokingKeyId: string | null;
+    recentKeyId?: string | null;
     onopenissue: (app: Application) => void;
     onrequestrevoke: (app: Application, key: ApiKey) => void;
   }
 
-  let { app, issuanceBlocked, revokingKeyId, onopenissue, onrequestrevoke }: Props = $props();
+  let {
+    app,
+    issuanceBlocked,
+    revokingKeyId,
+    recentKeyId = null,
+    onopenissue,
+    onrequestrevoke,
+  }: Props = $props();
 
   let statusFilter = $state<StatusFilter>('all');
   let searchQuery = $state('');
@@ -105,7 +113,7 @@
           title={copiedId ? 'Copied' : 'Copy application ID'}
         >
           {#if copiedId}
-            <Check class="size-3.5 text-success" />
+            <Check class="animate-in fade-in-0 zoom-in-75 duration-150 size-3.5 text-success" />
           {:else}
             <Copy class="size-3.5" />
           {/if}
@@ -124,7 +132,7 @@
   </div>
 
   {#if app.keys.length === 0}
-    <div class="flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-14 text-center">
+    <div class="animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out flex flex-col items-center justify-center rounded-lg border border-dashed border-border px-6 py-14 text-center">
       <div
         class="mb-3 flex size-10 items-center justify-center rounded-lg border border-border bg-muted/50 text-muted-foreground"
         aria-hidden="true"
@@ -163,7 +171,12 @@
           />
         </div>
         {#if isFiltered}
-          <Button variant="ghost" size="sm" onclick={resetFilters} class="text-muted-foreground">
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={resetFilters}
+            class="animate-in fade-in-0 duration-150 text-muted-foreground"
+          >
             Reset
             <RotateCcw class="size-3.5" />
           </Button>
@@ -179,7 +192,7 @@
           type="button"
           role="tab"
           aria-selected={statusFilter === 'all'}
-          class="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-sm px-2.5 text-xs font-medium transition-colors {statusFilter === 'all'
+          class="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-sm px-2.5 text-xs font-medium transition-all duration-150 {statusFilter === 'all'
             ? 'bg-background text-foreground shadow-xs'
             : 'hover:text-foreground'}"
           onclick={() => (statusFilter = 'all')}
@@ -191,7 +204,7 @@
           type="button"
           role="tab"
           aria-selected={statusFilter === 'active'}
-          class="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-sm px-2.5 text-xs font-medium transition-colors {statusFilter === 'active'
+          class="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-sm px-2.5 text-xs font-medium transition-all duration-150 {statusFilter === 'active'
             ? 'bg-background text-foreground shadow-xs'
             : 'hover:text-foreground'}"
           onclick={() => (statusFilter = 'active')}
@@ -203,7 +216,7 @@
           type="button"
           role="tab"
           aria-selected={statusFilter === 'revoked'}
-          class="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-sm px-2.5 text-xs font-medium transition-colors {statusFilter === 'revoked'
+          class="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-sm px-2.5 text-xs font-medium transition-all duration-150 {statusFilter === 'revoked'
             ? 'bg-background text-foreground shadow-xs'
             : 'hover:text-foreground'}"
           onclick={() => (statusFilter = 'revoked')}
@@ -235,18 +248,22 @@
           </thead>
           <tbody class="divide-y divide-border">
             {#if filteredKeys.length === 0}
-              <tr>
+              <tr class="animate-in fade-in-0 duration-150">
                 <td colspan="4" class="h-24 px-4 text-center text-sm text-muted-foreground">
                   No keys match your current filter.
                 </td>
               </tr>
             {:else}
               {#each filteredKeys as key (key.id)}
-                <tr class="transition-colors hover:bg-muted/40">
+                <tr
+                  class="transition-colors duration-150 hover:bg-muted/40 {recentKeyId === key.id
+                    ? 'kg-row-highlight'
+                    : 'animate-in fade-in-0 slide-in-from-bottom-1 duration-150 ease-out'}"
+                >
                   <td class="px-4 py-3 align-middle">
                     <div class="min-w-0">
                       <strong
-                        class="block break-words font-medium {key.revoked
+                        class="block break-words font-medium transition-colors duration-200 {key.revoked
                           ? 'text-muted-foreground line-through decoration-muted-foreground/50'
                           : 'text-foreground'}"
                       >

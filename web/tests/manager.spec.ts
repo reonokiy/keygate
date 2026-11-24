@@ -264,3 +264,17 @@ test('renders OIDC display name and avatar with fallback on image error', async 
   await expect(page.locator('#identity')).toHaveText('alice');
   await expect(page.locator('header img')).toHaveCount(0);
 });
+
+test('theme toggle and reduced-motion animations work cleanly under production CSP', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  const { errors } = await serveManager(page, '/', { secondApp: true });
+  await page.getByRole('button', { name: 'Toggle color theme' }).click();
+  await expect(page.locator('html')).toHaveClass(/dark|light/);
+  await page.getByRole('button', { name: 'Generate key' }).click();
+  await page.getByLabel('Key name').fill('animated key');
+  await page.getByRole('button', { name: 'Create key' }).click();
+  await expect(page.getByLabel('New API key')).toHaveValue(token);
+  await page.getByRole('button', { name: 'Saved, close' }).click();
+  await expect(page.locator('tbody tr.kg-row-highlight')).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
